@@ -27,6 +27,7 @@ from app.followup import FollowupWorker
 from app.llm import OpenAiLlm
 from app.multiorg import (
     CrmSinOrganizacion,
+    LlmSinLlave,
     LlmSinOrganizacion,
     RegistroDeOrganizaciones,
 )
@@ -97,9 +98,13 @@ def create_app(ctx: AppContext | None = None) -> FastAPI:
                 # construirlo —Nea no lleva la llave de nadie—, uno de verdad
                 # aquí le cobraría al dueño de la plataforma el consumo de sus
                 # miembros si algún camino se olvidara de cambiarlo.
+                # Wline (N1): un solo negocio en cloud sin llave propia piensa
+                # por el CRM; el cliente de cada turno lo arma el despacho.
                 llm=(
                     LlmSinOrganizacion()
                     if settings.multi_org
+                    else LlmSinLlave()
+                    if settings.cloud_mode and not settings.llm_api_key.strip()
                     else OpenAiLlm(
                         settings.llm_api_key,
                         settings.llm_model,

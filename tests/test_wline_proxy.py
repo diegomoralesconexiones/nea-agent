@@ -12,12 +12,16 @@ import json
 from typing import Any
 
 import httpx
+import pytest
 import respx
 
+from app import main
 from app.config import Settings
 from app.dispatch import _contexto_una_organizacion
 from app.llm import OpenAiLlm
+from app.multiorg import LlmSinLlave
 from app.state import AppContext, MemoryStore
+from tests.test_multiorg import _StoreDePrueba, _WorkerQuieto
 
 CRM_URL = "http://crm.test"
 SECRETO = "secreto-del-cerebro-de-prueba"
@@ -99,6 +103,37 @@ async def test_sin_contexto_todo_sigue_como_siempre() -> None:
 async def test_un_crm_sin_precarga_no_cambia_nada() -> None:
     ctx = _ctx(object())
     assert await _contexto_una_organizacion(ctx, CONV) is ctx
+
+
+@pytest.fixture
+def arranque_wline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Como la levanta docker-compose.nea.dev.yml: un negocio, sin llave propia."""
+    monkeypatch.setenv("VOCERO_MODE", "cloud")
+    monkeypatch.setenv("CRM_ORGANIZATION", "principal")
+    monkeypatch.setenv("CRM_BASE_URL", CRM_URL)
+    monkeypatch.setenv("CRM_BRAIN_SECRET", SECRETO)
+    monkeypatch.setenv("DATABASE_URL", "postgres://no-se-usa")
+    for ausente in ("LLM_API_KEY", "OPENAI_API_KEY"):
+        monkeypatch.setenv(ausente, "")
+    monkeypatch.setattr(main, "PgStore", lambda *_a, **_k: _StoreDePrueba())
+    monkeypatch.setattr(main, "RelayWorker", _WorkerQuieto)
+    monkeypatch.setattr(main, "FollowupWorker", _WorkerQuieto)
+    monkeypatch.setattr(main, "SenderWorker", _WorkerQuieto)
+
+
+@respx.mock
+async def test_sin_llave_propia_la_nea_de_un_negocio_arranca(arranque_wline: None) -> None:
+    """El fallo que tumbaba el contenedor: el SDK no se construye sin llave."""
+    respx.route(url__startswith=CRM_URL).mock(return_value=httpx.Response(404))
+    app = main.create_app()
+    async with app.router.lifespan_context(app):
+        ctx = app.state.ctx
+        assert not ctx.settings.multi_org
+        assert isinstance(ctx.llm, LlmSinLlave)
+        # Y si algún camino lo usara, revienta con el motivo, no finge un fallo
+        # del proveedor.
+        with pytest.raises(RuntimeError, match="sin llave"):
+            await ctx.llm.complete([{"role": "user", "content": "hola"}])
 
 
 @respx.mock

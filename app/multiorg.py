@@ -296,6 +296,25 @@ class LlmSinOrganizacion:
             f"arma el despacho, no el arranque"
         )
 
+
+class LlmSinLlave:
+    """El modelo de una Nea de UN negocio que piensa por el CRM (Wline, N1).
+
+    Hermano de `LlmSinOrganizacion`. En modo cloud sin `LLM_API_KEY` la llave
+    del proveedor vive en el CRM: cada turno arma su cliente con el `llm` del
+    contexto (ver `_contexto_una_organizacion` en `app/dispatch.py`). Construir
+    aquí un `OpenAiLlm` sin llave tumbaba el arranque ("Missing credentials").
+    Solo se usaría si el CRM no ofreciera `llm`, y entonces revienta con el
+    motivo en vez de fingir un fallo del proveedor.
+    """
+
+    def __getattr__(self, nombre: str) -> Any:
+        raise RuntimeError(
+            f"se intentó usar el modelo ({nombre}) sin llave: esta Nea no tiene "
+            f"LLM_API_KEY y el CRM no ofreció pensar por ella (`llm` en el "
+            f"contexto)"
+        )
+
 def ctx_de_organizacion(
     ctx: "AppContext",
     organization_id: str,
