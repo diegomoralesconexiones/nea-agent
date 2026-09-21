@@ -63,6 +63,53 @@ logger = logging.getLogger("nea.multiorg")
 DOMINIO = "vocero:cerebro:v1"
 
 
+# Clientes del modelo que piensan por el CRM, cacheados por la tupla completa:
+# si cambia el modelo o la ruta, la tupla cambia y el siguiente turno ya usa
+# el cliente nuevo sin que nadie tenga que invalidar nada.
+_LLMS_HACIA_CRM: dict[tuple[str, str, str, str, str], OpenAiLlm] = {}
+
+
+def llm_hacia_crm(
+    crm_base_url: str,
+    credencial: str,
+    slug: str,
+    config: dict[str, Any],
+    por_defecto: Any,
+    cache: dict[tuple[str, str, str, str, str], OpenAiLlm] | None = None,
+) -> OpenAiLlm:
+    """El cliente del modelo apuntando al CRM (el CRM pone la llave al reenviar).
+
+    Lo usan las dos variantes del modo cloud: la multi-organización (con la
+    credencial derivada de cada organización) y la de un solo negocio (Wline,
+    N1: con `CRM_BRAIN_SECRET`). Para el SDK de OpenAI es un proveedor
+    compatible más, así que el resto del turno no se entera.
+
+    `por_defecto` son los ajustes de esta Nea y solo rellenan el modelo que
+    conversa. El que TRANSCRIBE no se rellena: si el CRM no ofrece uno que
+    oiga, es mejor no transcribir que mandarle el audio a uno que no oye.
+    """
+    base_url = crm_base_url.rstrip("/") + str(config.get("path") or "/api/brains/llm")
+    model = str(config.get("model") or por_defecto.llm_model)
+    transcribe = str(config.get("transcribeModel") or "")
+    cache = _LLMS_HACIA_CRM if cache is None else cache
+    clave = (credencial, model, transcribe, base_url, slug)
+    cliente = cache.get(clave)
+    if cliente is None:
+        cliente = OpenAiLlm(
+            credencial,
+            model,
+            transcribe_model=transcribe,
+            base_url=base_url,
+            default_headers={"X-Vocero-Organization": slug},
+            # Los ajustes de velocidad son de esta Nea: el CRM reenvía el
+            # cuerpo, así que `extra_body` llega igual (o se descarta allá).
+            reasoning_effort=por_defecto.llm_reasoning_effort,
+            provider_sort=por_defecto.llm_provider_sort,
+        )
+        cache[clave] = cliente
+    return cliente
+
+
 def credencial_derivada(secreto_despliegue: str, organization_id: str) -> str:
     """La credencial de UNA organización dentro de este despliegue.
 
@@ -106,7 +153,7 @@ class RegistroDeOrganizaciones:
         # Cacheados por la tupla completa y no por organizacion: si el miembro
         # cambia de modelo, la tupla cambia y el siguiente turno ya usa el
         # cliente nuevo sin que nadie tenga que invalidar nada.
-        self._llms: dict[tuple[str, str, str, str], OpenAiLlm] = {}
+        self._llms: dict[tuple[str, str, str, str, str], OpenAiLlm] = {}
 
     def cliente(self, organization_id: str, slug: str) -> BrainsCrmClient:
         cliente = self._clientes.get(organization_id)
@@ -161,29 +208,14 @@ class RegistroDeOrganizaciones:
         eligió uno que oiga, es mejor no transcribir que mandarle el audio a
         uno que no oye y quedarnos con lo que invente.
         """
-        base_url = self._base_url.rstrip("/") + str(
-            config.get("path") or "/api/brains/llm"
+        return llm_hacia_crm(
+            self._base_url,
+            credencial_derivada(self._secreto, organization_id),
+            slug,
+            config,
+            por_defecto,
+            self._llms,
         )
-        model = str(config.get("model") or por_defecto.llm_model)
-        transcribe = str(config.get("transcribeModel") or "")
-        credencial = credencial_derivada(self._secreto, organization_id)
-        clave = (credencial, model, transcribe, base_url)
-        cliente = self._llms.get(clave)
-        if cliente is None:
-            cliente = OpenAiLlm(
-                credencial,
-                model,
-                transcribe_model=transcribe,
-                base_url=base_url,
-                default_headers={"X-Vocero-Organization": slug},
-                # Los ajustes de velocidad son de esta Nea, no del miembro:
-                # el CRM reenvia el cuerpo TAL CUAL, asi que `extra_body`
-                # llega al proveedor igual que en mono-organizacion.
-                reasoning_effort=por_defecto.llm_reasoning_effort,
-                provider_sort=por_defecto.llm_provider_sort,
-            )
-            self._llms[clave] = cliente
-        return cliente
 
     async def aclose(self) -> None:
         for cliente in self._clientes.values():

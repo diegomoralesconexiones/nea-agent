@@ -375,6 +375,30 @@ class BrainsCrmClient(CrmClient):
             raise CrmError(f"{que} devolvió {resp.status_code}")
         return _aplanar_reserva(resp.json())
 
+    async def cerrar_despacho(
+        self, dispatch_id: str, provider_ms: int | None, error: str | None
+    ) -> None:
+        """Avisa al CRM que el turno de ese despacho terminó (Wline, N7).
+
+        Siempre, también si falló: el CRM tiene la conversación esperando el
+        cierre y, sin él, espera hasta su tope antes de seguir. El desenlace
+        lo deriva el CRM de lo que observó; aquí solo va la latencia del
+        modelo y el error, si lo hubo. Un fallo al avisar se registra y ya:
+        el turno terminó igual.
+        """
+        if not dispatch_id:
+            return
+        try:
+            resp = await self._request(
+                "POST",
+                f"/api/brains/dispatch/{dispatch_id}/close",
+                json={"providerMs": provider_ms, "error": (error or None) and error[:500]},
+            )
+            if not resp.is_success:
+                logger.warning("cierre del despacho %s: el CRM respondió %s", dispatch_id, resp.status_code)
+        except Exception:
+            logger.exception("no pude cerrar el despacho %s", dispatch_id)
+
     async def post_reset(self, conversation_id: str) -> None:
         """El reinicio de pruebas no existe en esta superficie.
 

@@ -415,6 +415,9 @@ class AppContext:
     # arrancar (y se corrige solo si en caliente resulta que no está), para no
     # ofrecerle horarios a un lead contra un CRM que no puede agendarlos.
     agenda_enabled: bool = True
+    # Wline (N8): el despacho es de una conversación de PRUEBA (Laboratorio).
+    # El CRM la mantiene en sandbox, así que la allowlist no aplica.
+    es_prueba: bool = False
     # Un candado por identidad: los turnos de UNA conversación se serializan.
     # Sin esto, una ráfaga que llega mientras el turno anterior sigue en vuelo
     # abre un segundo turno con contexto viejo (se reservó una cita antes de

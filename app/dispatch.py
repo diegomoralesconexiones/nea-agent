@@ -30,7 +30,8 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from app.multiorg import organizacion_del_despacho
+from app.llm import medir_turno
+from app.multiorg import llm_hacia_crm, organizacion_del_despacho
 from app.state import AppContext, InboundMessage
 from app.turn import handle_flush
 
@@ -39,6 +40,10 @@ logger = logging.getLogger("nea.dispatch")
 router = APIRouter()
 
 _bg_tasks: set[asyncio.Task[Any]] = set()
+
+# Wline (N9): versiones del contrato CRM ⇄ cerebro que esta Nea entiende. Un
+# despacho sin `contractVersion` (el CRM de origen) se procesa igual.
+CONTRATOS_SOPORTADOS = (1,)
 
 
 def firma_valida(body: bytes, header: str | None, secret: str) -> bool:
@@ -118,6 +123,17 @@ async def recibir(request: Request) -> Any:
     if not isinstance(payload, dict):
         return JSONResponse({"error": "cuerpo inesperado"}, status_code=400)
 
+    # Wline (N9): un contrato que no entiendo se rechaza ANTES de acusar, con
+    # un 409 que el CRM no reintenta y que distingue de una caída: así la
+    # conversación pasa a un humano y el estado dice "versión incompatible".
+    version = payload.get("contractVersion")
+    if version is not None and version not in CONTRATOS_SOPORTADOS:
+        logger.warning("despacho con contractVersion %r no soportada — 409", version)
+        return JSONResponse(
+            {"error": {"code": "contrato_incompatible", "supported": list(CONTRATOS_SOPORTADOS)}},
+            status_code=409,
+        )
+
     task = asyncio.create_task(_procesar(ctx, payload))
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
@@ -125,6 +141,32 @@ async def recibir(request: Request) -> Any:
 
 
 async def _procesar(ctx: AppContext, payload: dict[str, Any]) -> None:
+    """El turno del despacho y, al final, su cierre explícito (Wline, N7).
+
+    El cierre va en `finally`: también si el turno falló. El CRM tiene la
+    conversación esperando y, sin el aviso, esperaría hasta su tope. Solo se
+    cierra lo que de verdad se procesó: un despacho repetido que el dedup
+    descarta NO cierra — el original sigue en curso y cerrarlo antes de
+    tiempo le haría al CRM contar mal el turno.
+    """
+    dispatch_id = str(payload.get("dispatchId") or "")
+    latencias = medir_turno()
+    estado: dict[str, Any] = {"procesado": False, "crm": ctx.crm}
+    error: str | None = None
+    try:
+        await _turno_del_despacho(ctx, payload, estado)
+    except Exception as exc:  # el turno nunca tumba el proceso
+        error = f"{type(exc).__name__}: {exc}"
+        logger.exception("despacho %s reventó", dispatch_id)
+    finally:
+        cerrar = getattr(estado["crm"], "cerrar_despacho", None)
+        if estado["procesado"] and dispatch_id and callable(cerrar):
+            await cerrar(dispatch_id, round(sum(latencias)) if latencias else None, error)
+
+
+async def _turno_del_despacho(
+    ctx: AppContext, payload: dict[str, Any], estado: dict[str, Any]
+) -> None:
     dispatch_id = str(payload.get("dispatchId") or "")
     conversation = payload.get("conversation") or {}
     conversation_id = str(conversation.get("id") or "")
@@ -143,18 +185,26 @@ async def _procesar(ctx: AppContext, payload: dict[str, Any]) -> None:
         if not fresco:
             logger.info("dedup: despacho %s ya procesado — ignorado", dispatch_id)
             return
+    estado["procesado"] = True
 
     if ctx.settings.multi_org:
         ctx_turno = await _contexto_multiorg(ctx, payload, identity, conversation_id)
         if ctx_turno is None:
             return  # el motivo ya quedó en el log, y la conversación con humano
+        estado["crm"] = ctx_turno.crm
     else:
         # El CRM ya sabe de quién es esta conversación; el cliente lo recuerda
         # para no preguntarlo por teléfono, que en esta superficie ni se puede.
         registrar = getattr(ctx.crm, "registrar", None)
         if callable(registrar):
             registrar(identity, conversation_id)
-        ctx_turno = ctx
+        ctx_turno = await _contexto_una_organizacion(ctx, conversation_id)
+        if ctx_turno is None:
+            return  # sin con qué pensar: la conversación ya quedó con un humano
+
+    # Wline (N8): la conversación de prueba del CRM salta la allowlist.
+    if (payload.get("conversation") or {}).get("isTest") is True:
+        ctx_turno = replace(ctx_turno, es_prueba=True)
 
     # Y de qué despacho es. Sin esto el CRM rechaza la respuesta con 422: el
     # `dispatchId` es lo que le deja no responder dos veces al mismo cliente
@@ -170,6 +220,41 @@ async def _procesar(ctx: AppContext, payload: dict[str, Any]) -> None:
 
     # Directo al turno, sin coalescer: el CRM ya agrupó la ráfaga.
     await handle_flush(ctx_turno, identity, mensajes)
+
+
+async def _contexto_una_organizacion(
+    ctx: AppContext, conversation_id: str
+) -> AppContext | None:
+    """Una sola organización que piensa por el CRM (Wline, N1).
+
+    Si el contexto trae `llm`, el turno piensa por `{CRM}{llm.path}` con el
+    secreto del cerebro: la llave del proveedor se queda en el CRM. `llm:
+    null` = el CRM no tiene con qué pensar → nadie contesta con una llave
+    propia y la conversación pasa a un humano. Sin `llm` en el contexto (un
+    CRM que no lo ofrece), el comportamiento de siempre: `LLM_API_KEY`.
+    """
+    precargar = getattr(ctx.crm, "precargar", None)
+    if not callable(precargar):
+        return ctx
+    contexto = await precargar(conversation_id)
+    if contexto is None or "llm" not in contexto:
+        return ctx
+    config_ia = contexto.get("llm")
+    if not config_ia:
+        logger.warning("el CRM no ofrece IA para %s — sin turno", conversation_id)
+        await _a_humano(ctx.crm, conversation_id, "sin_credencial")
+        return None
+    settings = ctx.settings
+    return replace(
+        ctx,
+        llm=llm_hacia_crm(
+            settings.crm_base_url,
+            settings.crm_brain_secret,
+            settings.crm_organization,
+            config_ia,
+            settings,
+        ),
+    )
 
 
 async def _contexto_multiorg(

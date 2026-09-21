@@ -102,7 +102,9 @@ async def run_turn(
 
     # --- Gate 1: allowlist de pruebas (Constitución V) --------------------
     allowed = settings.allowed_identities
-    if allowed and canonical_identity(identity) not in allowed:
+    # Wline (N8): una conversación de prueba del CRM se atiende siempre — el
+    # CRM la mantiene en sandbox y jamás toca WhatsApp con ella.
+    if allowed and not ctx.es_prueba and canonical_identity(identity) not in allowed:
         logger.info(
             "allowlist: %s fuera de ALLOWED_WA_IDS — relay sí, respuesta no", identity
         )

@@ -11,14 +11,31 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from openai import AsyncOpenAI
 
 logger = logging.getLogger("nea.llm")
+
+
+# Wline (N7): latencia del modelo acumulada POR TURNO. Es una variable de
+# contexto y no un contador de la instancia porque la misma instancia atiende
+# turnos concurrentes; cada despacho corre en su propia tarea asyncio.
+_latencia_turno: contextvars.ContextVar[list[float] | None] = contextvars.ContextVar(
+    "nea_latencia_turno", default=None
+)
+
+
+def medir_turno() -> list[float]:
+    """Empieza a medir el turno en curso; devuelve la lista que se irá llenando."""
+    acumulado: list[float] = []
+    _latencia_turno.set(acumulado)
+    return acumulado
 
 
 class LlmExhausted(Exception):
@@ -253,6 +270,20 @@ class OpenAiLlm:
             )
 
     async def complete(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> LlmReply:
+        """Una respuesta del modelo; anota su latencia en el turno (Wline, N7)."""
+        inicio = time.monotonic()
+        try:
+            return await self._complete(messages, tools)
+        finally:
+            acumulado = _latencia_turno.get()
+            if acumulado is not None:
+                acumulado.append((time.monotonic() - inicio) * 1000)
+
+    async def _complete(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
