@@ -245,7 +245,7 @@ async def run_turn(
         ]
 
     # --- LLM con tools ----------------------------------------------------
-    runtime = ToolRuntime(ctx, conv, str(crm_conv_id), profile=profile)
+    runtime = ToolRuntime(ctx, conv, str(crm_conv_id), profile=profile, context=context)
     try:
         final_text = await _tool_loop(ctx, messages, runtime)
     except LlmExhausted as exc:
@@ -305,7 +305,12 @@ async def run_turn(
         updates["stalled_at"] = utcnow()
         updates["phase"] = "cerrada"
         updates["followup_due_at"] = None
-    elif runtime.handoff_reason is not None or runtime.booked or runtime.routed_out:
+    elif (
+        runtime.handoff_reason is not None
+        or runtime.booked
+        or runtime.routed_out
+        or runtime.umbral  # Wline (N3): ya está con una persona
+    ):
         updates["phase"] = "cerrada"
         updates["followup_due_at"] = None
     else:
@@ -409,7 +414,7 @@ async def _tool_loop(
     """
     for _ in range(MAX_TOOL_ROUNDS):
         reply = await ctx.llm.complete(
-            messages, tools=tool_schemas(ctx.agenda_enabled, bool(getattr(ctx.crm, "supports_agenda_v2", False)), bool(getattr(ctx.crm, "supports_coordination", False)))
+            messages, tools=runtime.catalogo(tool_schemas(ctx.agenda_enabled, bool(getattr(ctx.crm, "supports_agenda_v2", False)), bool(getattr(ctx.crm, "supports_coordination", False))))
         )
         if not reply.tool_calls:
             return reply.content  # turno de puro texto

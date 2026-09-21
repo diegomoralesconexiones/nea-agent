@@ -24,6 +24,7 @@ from app.crm import (
     SlotNotOffered,
     SlotTaken,
 )
+from app import wline
 from app.profile import BusinessProfile
 from app.state import AppContext, Conversation, OfferedSlot
 
@@ -361,17 +362,27 @@ class ToolRuntime:
         conv: Conversation,
         crm_conversation_id: str,
         profile: BusinessProfile | None = None,
+        context: dict[str, Any] | None = None,
     ) -> None:
         self._ctx = ctx
         self._conv = conv
         self._crm_conv_id = crm_conversation_id
         self._profile = profile or BusinessProfile()
+        # Wline (N2–N4): el contexto del CRM decide el catálogo de este turno.
+        self._context = context
         # Efectos observables por turn.py:
         self.handoff_reason: str | None = None  # se ejecuta DESPUÉS de la despedida
         self.booked = False
         self.booking_confirmation: dict[str, Any] | None = None
         self.routed_out = False
         self.proposed = False
+        # Wline (N3): la clasificación alcanzó el umbral — el CRM ya pausó la
+        # IA con motivo `umbral`; el turno solo se despide.
+        self.umbral = False
+
+    def catalogo(self, base: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Las herramientas de este turno (Wline las ajusta por contexto)."""
+        return wline.catalogo(base, self._context)
 
     async def execute(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -394,7 +405,11 @@ class ToolRuntime:
             if name == "reschedule_session":
                 return await self._reschedule_session(args)
             if name == "route_out":
+                if wline.es_wline(self._context):
+                    return await self._redirigir(args)
                 return await self._route_out()
+            if name == "clasificar_lead":
+                return await self._clasificar(args)
             if name == "handoff":
                 return self._handoff(args)
             logger.warning("tools: herramienta desconocida %r", name)
@@ -412,8 +427,40 @@ class ToolRuntime:
         ficha = {k: v for k, v in args.items() if v is not None}
         if not ficha:
             return {"ok": True, "nota": "sin campos nuevos"}
-        await self._ctx.crm.put_ficha(self._crm_conv_id, ficha)
-        return {"ok": True}
+        respuesta = await self._ctx.crm.put_ficha(self._crm_conv_id, ficha)
+        # Wline (N2): los rechazos del CRM vuelven al modelo.
+        return wline.resultado_ficha(respuesta if isinstance(respuesta, dict) else None)
+
+    async def _clasificar(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Wline (N3): propone la ubicación; el CRM decide."""
+        mover = getattr(self._ctx.crm, "move_lead", None)
+        if not callable(mover) or not wline.capacidad(self._context, "mover_pipeline"):
+            return {"ok": False, "error": "clasificar no está disponible"}
+        respuesta = await mover(
+            self._crm_conv_id, str(args.get("linea") or ""), str(args.get("etapa") or "")
+        )
+        resultado = wline.resultado_clasificar(respuesta)
+        if resultado.get("handoff"):
+            self.umbral = True
+        return resultado
+
+    async def _redirigir(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Wline (N4): el lead no califica, con motivo. Ya no toca la ficha."""
+        motivo = str(args.get("motivo") or "").strip()
+        redirigir = getattr(self._ctx.crm, "redirect_lead", None)
+        if not callable(redirigir) or not wline.capacidad(self._context, "redirigir"):
+            return {"ok": False, "error": "redirigir no está disponible"}
+        if not motivo:
+            return {"ok": False, "error": "motivo_requerido", "instrucciones": "di por qué no califica"}
+        respuesta = await redirigir(self._crm_conv_id, motivo[:300])
+        if not (respuesta or {}).get("ok"):
+            return {"ok": False, "rechazo": (respuesta or {}).get("rejection"), "detalle": (respuesta or {}).get("detail")}
+        self.routed_out = True
+        out: dict[str, Any] = {"ok": True}
+        if self._profile.resources:
+            out["recursos"] = self._profile.resources
+            out["instrucciones"] = "comparte estos recursos al despedirte, puerta abierta"
+        return out
 
     async def _propose_slots(self, args: dict[str, Any]) -> dict[str, Any]:
         fecha = _fecha_pedida(args.get("fecha"))
@@ -752,6 +799,10 @@ class ToolRuntime:
         return out
 
     def _handoff(self, args: dict[str, Any]) -> dict[str, Any]:
+        if self.umbral:
+            # Wline (N3): el CRM ya lo pasó a una persona con motivo `umbral`;
+            # otro handoff lo pisaría con un motivo que no es.
+            return {"ok": True, "nota": "ya está con una persona; solo despídete"}
         self.handoff_reason = str(args.get("reason") or "lead_request")
         return {
             "ok": True,

@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import json
+from app import wline
 from app.profile import BusinessProfile
 from app.state import Conversation, OfferedSlot
 
@@ -364,6 +365,8 @@ def build_system_prompt(
         )
 
     lines.extend(_booking_lines((context or {}).get("booking"), now))
+    # Wline (N2, N5): ficha pendiente, líneas, criterios, umbral y ubicación.
+    lines.extend(wline.seccion_prompt(context))
 
     return (
         _chassis(profile)

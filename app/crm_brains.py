@@ -399,6 +399,35 @@ class BrainsCrmClient(CrmClient):
         except Exception:
             logger.exception("no pude cerrar el despacho %s", dispatch_id)
 
+    async def move_lead(self, conversation_id: str, linea: str, etapa: str) -> dict[str, Any]:
+        """Propone ubicar al lead (Wline, N3). El CRM decide.
+
+        Un rechazo NO es un error: llega como 200 `{ok:false, rejection,
+        detail}` y el modelo sigue conversando. Solo un cuerpo mal formado o
+        una caída son `CrmError`.
+        """
+        return await self._propuesta(
+            "/api/brains/pipeline/move",
+            {"conversationId": conversation_id, "line": linea, "stage": etapa},
+        )
+
+    async def redirect_lead(self, conversation_id: str, motivo: str) -> dict[str, Any]:
+        """Propone redirigir al lead porque no califica (Wline, N4)."""
+        return await self._propuesta(
+            "/api/brains/pipeline/redirect",
+            {"conversationId": conversation_id, "reason": motivo},
+        )
+
+    async def _propuesta(self, ruta: str, cuerpo: dict[str, Any]) -> dict[str, Any]:
+        despacho = self.despacho_de(str(cuerpo["conversationId"]))
+        if despacho:
+            cuerpo = {**cuerpo, "dispatchId": despacho}
+        resp = await self._request("POST", ruta, json=cuerpo)
+        if not resp.is_success:
+            raise CrmError(f"{ruta} devolvió {resp.status_code}")
+        data: dict[str, Any] = resp.json()
+        return data
+
     async def post_reset(self, conversation_id: str) -> None:
         """El reinicio de pruebas no existe en esta superficie.
 
