@@ -139,7 +139,12 @@ def create_app(ctx: AppContext | None = None) -> FastAPI:
                 "que acepte audio (no todos oyen — los GLM, por ejemplo, no)."
             )
 
-        if own_resources:
+        # Wline (N6): en modo cloud la agenda se decide POR TURNO con las
+        # capacidades que manda el CRM, no con un sondeo al arrancar: una
+        # respuesta que no sea 404 (p. ej. un "no disponible" con 200) se leía
+        # como "hay agenda" para siempre, y cambiar la capacidad obligaba a
+        # reiniciar.
+        if own_resources and not c.settings.cloud_mode:
             # ¿Este CRM agenda? Vocero trae el motor detrás de una bandera de
             # despliegue y viene apagado por defecto. Se pregunta una vez, aquí,
             # en vez de descubrirlo lead por lead: así el primero que escriba ya

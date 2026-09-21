@@ -172,6 +172,26 @@ def route_out_tool() -> dict[str, Any]:
     }
 
 
+# ── N6: la agenda por turno ──────────────────────────────────────────────
+
+# Todo lo que agenda: sin la capacidad `agendar`, nada de esto se ofrece.
+HERRAMIENTAS_DE_AGENDA = frozenset(
+    {
+        "propose_slots",
+        "book_session",
+        "reschedule_session",
+        "list_bookings",
+        "cancel_session",
+        "coordination_consent",
+    }
+)
+
+
+def agenda(context: dict[str, Any] | None, por_defecto: bool) -> bool:
+    """¿Se ofrece agendar en este turno? Con Wline, lo dice su capacidad."""
+    return capacidad(context, "agendar") if es_wline(context) else por_defecto
+
+
 # ── El catálogo del turno ────────────────────────────────────────────────
 
 
@@ -180,9 +200,12 @@ def catalogo(base: list[dict[str, Any]], context: dict[str, Any] | None) -> list
     if not es_wline(context):
         return base
     fields = ((context or {}).get("ficha") or {}).get("fields")
+    con_agenda = agenda(context, False)
     out: list[dict[str, Any]] = []
     for tool in base:
         name = tool.get("function", {}).get("name")
+        if name in HERRAMIENTAS_DE_AGENDA and not con_agenda:
+            continue
         if name == "update_ficha" and isinstance(fields, list):
             out.append(ficha_tool(fields))
         elif name == "route_out":

@@ -15,7 +15,7 @@ from datetime import timedelta
 from typing import Any, AsyncIterator
 from zoneinfo import ZoneInfo
 
-from app import media
+from app import media, wline
 from app.config import canonical_identity
 from app.crm import CrmConflict, CrmError
 from app.hostility import ALERT as HOSTILITY_ALERT, hostile_streak
@@ -207,7 +207,8 @@ async def run_turn(
         conv=conv,
         referral_headline=referral,
         offered=offered,
-        agenda=ctx.agenda_enabled,
+        # Wline (N6): con Wline, la agenda la decide su capacidad en este turno.
+        agenda=wline.agenda(context, ctx.agenda_enabled),
         tz=_agent_tz(settings),
     )
     # Se traen más mensajes de los que ve el LLM: el candado de cierre cuenta
