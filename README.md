@@ -107,6 +107,58 @@ Sin la bandera no cambia nada: el webhook de Meta, el relay y `/api/bot/*`
 siguen siendo los de siempre. Las variables del modo cloud están en
 `.env.example`.
 
+### Con Wline (este fork, rama `wline-023`)
+
+Este repositorio es un fork de [kevinrivm/nea-agent](https://github.com/kevinrivm/nea-agent)
+que conecta Nea como **cerebro externo** de [Wline](https://github.com/diegomoralesconexiones/wline),
+un CRM de WhatsApp self-hosted. Es el modo cloud de una sola organización, con
+lo que Wline agrega a su contrato (v1):
+
+- **Piensa por Wline (N1).** El contexto trae `llm`; el turno llama a
+  `{CRM}/api/brains/llm` con `CRM_BRAIN_SECRET`, y la llave del proveedor se
+  queda en Wline. Por eso `LLM_API_KEY` va **vacía**. `llm: null` = Wline no
+  tiene con qué pensar → handoff, sin llamar a nadie.
+- **Ficha, clasificación y redirección (N2–N5).** `update_ficha` se arma con
+  los campos que declaró el negocio; `clasificar_lead {linea, etapa}` y
+  `route_out {motivo}` proponen, y Wline decide (un rechazo vuelve al modelo).
+  El prompt explica líneas, criterios, umbral y dónde está el lead.
+- **Capacidades por turno (N6).** Las herramientas salen de
+  `context.capabilities` en cada turno; en modo cloud no hay sondeo de agenda
+  al arrancar.
+- **Cierre del despacho (N7)**, **conversaciones de prueba del Laboratorio
+  (N8)** y **versión del contrato (N9)**: `POST /api/brains/dispatch/{id}/close`
+  al terminar el turno; `conversation.isTest` salta `ALLOWED_WA_IDS`; un
+  `contractVersion` desconocido → `409 contrato_incompatible`.
+
+Todo lo específico vive en `app/wline.py` y se activa solo cuando el contexto
+trae `capabilities`: otro CRM recibe exactamente lo de siempre.
+
+Variables (además de las del modo cloud):
+
+```bash
+VOCERO_MODE=cloud
+CRM_ORGANIZATION=principal          # el slug de la organización en Wline
+CRM_BASE_URL=http://wline:3000
+CRM_BRAIN_SECRET=<la BOT_API_KEY de Wline>
+LLM_API_KEY=                        # vacía: piensa por Wline
+```
+
+Para desarrollo, Wline trae `docker-compose.nea.dev.yml`, que construye este
+clon (`../nea-agent`) con su propio Postgres:
+
+```bash
+docker compose --env-file .env.local -f docker-compose.nea.dev.yml up -d --build
+```
+
+**Rutina de deriva.** Al empezar cada feature que toque este fork:
+
+```bash
+git fetch upstream && git merge upstream/main && pytest -q
+```
+
+Los cambios genéricos (N1, N2, N6, N7, N8 y el motivo de N4) se proponen al
+original como PRs separados.
+
 ## Quickstart
 
 Requisitos: Python 3.11+, Postgres propio (no el del CRM), una instancia de
