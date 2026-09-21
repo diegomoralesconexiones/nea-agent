@@ -156,9 +156,6 @@ docker compose --env-file .env.local -f docker-compose.nea.dev.yml up -d --build
 git fetch upstream && git merge upstream/main && pytest -q
 ```
 
-Los cambios genéricos (N1, N2, N6, N7, N8 y el motivo de N4) se proponen al
-original como PRs separados.
-
 ## Quickstart
 
 Requisitos: Python 3.11+, Postgres propio (no el del CRM), una instancia de
