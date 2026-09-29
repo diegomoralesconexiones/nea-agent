@@ -105,6 +105,9 @@ def llm_hacia_crm(
             # cuerpo, así que `extra_body` llega igual (o se descarta allá).
             reasoning_effort=por_defecto.llm_reasoning_effort,
             provider_sort=por_defecto.llm_provider_sort,
+            # Y el tope por intento, también de esta Nea: el CRM reenvía,
+            # pero quien espera al proveedor colgado es el turno de aquí.
+            timeout=por_defecto.llm_timeout_seconds,
         )
         cache[clave] = cliente
     return cliente
@@ -251,6 +254,16 @@ class CrmSinOrganizacion:
         concluir. Si resulta que no, el primer intento real recibe 404 y las
         herramientas de agenda contestan "aquí no se agenda" — un camino que ya
         existe y está probado.
+        """
+        return True
+
+    async def sondear_agenda(self, timeout: float | None = None) -> bool | None:
+        """Lo mismo, para la sonda con caducidad (app/agenda.py).
+
+        True y no None a propósito: con None la sonda se quedaría con lo
+        último que supo, y tras un 404 de la bandera eso sería «apagada» para
+        siempre. Con True, al vencer el TTL se vuelve a intentar con el primer
+        turno que llegue, que es el que de verdad pregunta con credencial.
         """
         return True
 

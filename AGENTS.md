@@ -23,6 +23,9 @@ idempotentes al arranque · httpx (CRM y OpenAI) · pytest + respx · Docker
 | Atender a VARIOS negocios a la vez | `app/multiorg.py` |
 | Webhook/firma/dedup/relay | `app/webhook.py` · `app/relay.py` |
 | Coalesce y seguimiento | `app/coalesce.py` · `app/followup.py` |
+| Lo que el lead ve en WhatsApp (Markdown → WhatsApp) | `app/formato.py` |
+| El candado de cierre (conversación sin rumbo) | `app/stall.py` + gate 1.5 de `app/turn.py` |
+| `/health` (versión, commit, modo, relay) | `app/main.py` · `app/version.py` |
 | Tablas | `migrations/*.sql` (idempotentes, aplican al boot) |
 
 ## Reglas duras
@@ -55,6 +58,29 @@ idempotentes al arranque · httpx (CRM y OpenAI) · pytest + respx · Docker
   ambos lados; desviarse un byte da 401 mudo en todo.
 - **Degradación silenciosa**: LLM/CRM fallando jamás rompe el webhook ni manda
   texto roto; tras reintentos → silencio + handoff `error`.
+- **Un turno sin CRM se reintenta, y solo ese.** Si el gate 2 no alcanza al
+  CRM (red, 5xx, o un 404 con el mensaje todavía en el relay), `TurnoSinCrm`
+  reprograma la MISMA ráfaga (`TURN_RETRY_DELAYS`): una por conversación, y
+  lo que el lead escriba mientras tanto se fusiona en ella. Agotadas las
+  esperas, handoff `error` en cuanto el CRM conteste. Nada posterior a leer el
+  contexto se reintenta así: repetir un turno que ya pensó o escribió es
+  contestarle dos veces al lead.
+- **Todo lo que sale a WhatsApp pasa por `app/formato.py`** (turno y
+  seguimiento), y el historial guarda lo convertido: WhatsApp no pinta
+  Markdown, y si el modelo se ve escribiéndolo lo sigue escribiendo. Las URL y
+  los correos no se tocan nunca.
+- **El candado de cierre no es para siempre.** Tras la despedida, el relleno
+  (`es_relleno`) se contesta con silencio durante `STALL_COOLDOWN_HOURS`; un
+  mensaje con contenido reabre en el acto, la fase vuelve a descubrimiento y
+  los contadores cuentan desde `stall_since_message_id`. El cierre se anota en
+  la ficha del CRM (`cierre_sin_rumbo`) y se borra al reabrir.
+- **La identidad va en la forma del CRM**: el teléfono canónico o
+  `bsuid:<id>` (`identidad_del_mensaje`, espejo de `resolveIdentity` del CRM).
+  Con el BSUID pelón, `/api/bot/context` da 404 y el lead nunca recibe
+  respuesta.
+- **`/health` da 200 mientras la base conteste.** La cola del relay es
+  información para el CRM, no motivo para que Docker reinicie el contenedor. Y
+  no lleva secretos ni URLs: el webhook del CRM trae su token en la ruta.
 - **La agenda la manda el CRM.** Vocero registra la oferta contra la
   conversación (por eso `conversationId` va SIEMPRE en `get_availability`) y
   decide qué es reservable. `offered_slots` de Nea es un ESPEJO: sirve para
@@ -62,9 +88,17 @@ idempotentes al arranque · httpx (CRM y OpenAI) · pytest + respx · Docker
   red. Si el CRM responde `slot_not_offered`, su lista gana y el espejo se
   resincroniza — no se discute.
 - **La agenda puede no existir.** En Vocero va detrás de la bandera `AGENDA`,
-  apagada por defecto: esos endpoints responden 404. Se sondea al arrancar
-  (`crm.agenda_available()`); sin agenda no se le enseñan al modelo las
-  herramientas de agendar y el prompt se lo dice.
+  apagada por defecto: esos endpoints responden 404 **vacío** (un 404 con el
+  sobre de error del CRM es otra cosa: no existe la conversación o la cita).
+  Se sondea al arrancar y la respuesta caduca cada `AGENDA_PROBE_TTL_SECONDS`
+  (`app/agenda.py`): encender o apagar la bandera en el CRM llega sin
+  reiniciar Nea. Sin agenda no se le enseñan al modelo las herramientas de
+  agendar y el prompt se lo dice.
+- **No se ofrece lo que no hay con qué hacer.** Los recordatorios de la cita
+  existen solo con la agenda v2 de Vocero Cloud (`supports_agenda_v2`): sin
+  ella, `book_session` no lleva `recordatorios_aceptados` y el prompt dice que
+  no hay recordatorios. Un campo obligatorio en una herramienta es una
+  pregunta que el modelo le va a hacer al lead.
 
 ## Definición de Hecho
 

@@ -6,6 +6,8 @@ la validación de lo obligatorio ocurre al arranque real.
 """
 from __future__ import annotations
 
+import re
+
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -21,6 +23,26 @@ def canonical_identity(wa_id: str) -> str:
     if s.startswith("521") and len(s) == 13 and s.isdigit():
         return "52" + s[3:]
     return s
+
+
+# Tope de la suma de TURN_RETRY_DELAYS: pasado ese tiempo una respuesta ya no
+# contesta nada, y el turno se entrega a un humano (app/turn.py).
+TURN_RETRY_MAX_TOTAL_SECONDS = 600.0
+
+# Un BSUID tal como lo manda Meta: país, punto y el identificador
+# (`US.13491208655302741918`). El CRM lo guarda como `bsuid:<id>`.
+_BSUID_PELON = re.compile(r"^[A-Za-z]{2}\.[A-Za-z0-9]+$")
+
+
+def _identidad_de_lista(parte: str) -> str:
+    """Una entrada de ALLOWED_WA_IDS / TESTER_WA_IDS, en la forma del CRM.
+
+    Las identidades llegan como las guarda el CRM (app/webhook.py): el BSUID
+    con su prefijo `bsuid:`. En la lista vale escribirlo como lo enseña el
+    CRM o pelón, como sale en el payload de Meta.
+    """
+    s = canonical_identity(parte)
+    return f"bsuid:{s}" if _BSUID_PELON.match(s) else s
 
 
 class Settings(BaseSettings):
@@ -40,6 +62,10 @@ class Settings(BaseSettings):
     # CRM (vocero-crm, bot gateway /api/bot/*)
     crm_base_url: str = "http://localhost:3000"
     crm_webhook_url: str = ""  # incluye el segmento del verify token del CRM
+    # Relay al CRM (app/relay.py): la espera entre intentos crece al doble
+    # hasta este tope. Con 15 min, tras una caída larga el mensaje llegaba a
+    # la bandeja minutos después de que el CRM ya había vuelto.
+    relay_backoff_cap_seconds: float = Field(default=60.0, ge=1)
     crm_bot_api_key: str = ""
 
     # Perfil del negocio (capa de persona; ver app/profile.py)
@@ -113,6 +139,21 @@ class Settings(BaseSettings):
         default="throughput", validation_alias=AliasChoices("LLM_PROVIDER_SORT")
     )
 
+    # Cuánto se espera al proveedor del modelo en CADA intento, en segundos.
+    # Vale para conversar y para transcribir notas de voz (es el mismo cliente).
+    #
+    # Sin esto el SDK esperaba hasta 600 s por intento y además reintentaba
+    # dos veces por su cuenta, encima de los reintentos de Nea (llm.py): un
+    # proveedor colgado dejaba al lead mirando "escribiendo…" media hora larga
+    # antes de llegar al handoff `error`. Ahora el SDK no reintenta —ya lo
+    # hace Nea, con su backoff— y un intento que se pasa de este tope cuenta
+    # como fallido: tras los reintentos, silencio + handoff `error`.
+    llm_timeout_seconds: float = Field(
+        default=45.0,
+        gt=0,
+        validation_alias=AliasChoices("LLM_TIMEOUT_SECONDS"),
+    )
+
     # NO hay tope de tokens de salida, y es una decisión, no un olvido.
     #
     # En huaraches se puso uno el 8-sep con un banco que prometía partir a la
@@ -122,6 +163,13 @@ class Settings(BaseSettings):
     # DOS. Se quitó el mismo día.
 
     history_window: int = 10
+
+    # Cada cuántos segundos, como mucho, se le vuelve a preguntar al CRM si
+    # agenda (la bandera AGENDA de Vocero). Antes se preguntaba solo al
+    # arrancar: encenderla exigía reiniciar Nea. La pregunta la hace el primer
+    # turno que llega con la respuesta vencida, con timeout corto; si el CRM no
+    # contesta, se queda la última respuesta. 0 = en cada turno.
+    agenda_probe_ttl_seconds: float = Field(default=60.0, ge=0)
 
     # Guardarraíles y tiempos
     allowed_wa_ids: str = ""
@@ -133,8 +181,20 @@ class Settings(BaseSettings):
     tester_wa_ids: str = ""  # CSV; vacía = responde a todos (Constitución V)
     coalesce_seconds: float = 4.0
     followup_hours: float = 4.0
+    # Candado de cierre (app/stall.py): cuándo Nea se despide de una
+    # conversación que no va a ningún lado y cuánto calla después. Los
+    # valores por defecto son los de siempre; 0 apaga ese disparador.
+    stall_max_turns: int = Field(default=14, ge=0)
+    stall_filler_streak: int = Field(default=3, ge=0)
+    # Tras el cierre, el relleno ("gracias", "ok", un emoji) se contesta con
+    # silencio durante este tiempo; un mensaje con contenido reabre siempre.
+    stall_cooldown_hours: float = Field(default=24.0, ge=0)
     # "Escribiendo…" casi inmediato al recibir un mensaje (antes del coalesce).
     typing_delay_seconds: float = 0.5
+    # Turno sin CRM (app/turn.py): si el CRM no contesta (red o 5xx), la misma
+    # ráfaga se vuelve a intentar tras estas esperas, en segundos. CSV; la
+    # suma se corta a los 10 min. Vacío = no se reintenta.
+    turn_retry_delays: str = "15,45,120,300"
 
     # ── Modo cloud (Vocero multitenant) ───────────────────────────────
     #
@@ -212,8 +272,31 @@ class Settings(BaseSettings):
     @staticmethod
     def _identities(csv: str) -> frozenset[str]:
         return frozenset(
-            canonical_identity(part) for part in csv.split(",") if part.strip()
+            _identidad_de_lista(part) for part in csv.split(",") if part.strip()
         )
+
+    @property
+    def turn_retry_schedule(self) -> tuple[float, ...]:
+        """Las esperas entre reintentos de un turno que no alcanzó al CRM.
+
+        Tolerante como el resto de la configuración: lo que no es un número
+        positivo se ignora, y la suma no pasa de TURN_RETRY_MAX_TOTAL_SECONDS:
+        una respuesta que llega a los diez minutos ya no contesta nada.
+        """
+        esperas: list[float] = []
+        total = 0.0
+        for parte in self.turn_retry_delays.split(","):
+            try:
+                espera = float(parte.strip())
+            except ValueError:
+                continue
+            if espera <= 0:
+                continue
+            if total + espera > TURN_RETRY_MAX_TOTAL_SECONDS:
+                break
+            esperas.append(espera)
+            total += espera
+        return tuple(esperas)
 
     @property
     def allowed_identities(self) -> frozenset[str]:

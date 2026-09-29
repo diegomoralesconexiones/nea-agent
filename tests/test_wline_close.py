@@ -162,7 +162,7 @@ def turno_con_modelo(monkeypatch: pytest.MonkeyPatch) -> None:
     """El turno llama dos veces al modelo, de 20 ms cada una."""
     llm = _llm_lento(20)
 
-    async def handle_flush(ctx: AppContext, identity: str, items: list[Any]) -> None:
+    async def handle_flush(ctx: AppContext, identity: str, items: list[Any], **_: Any) -> None:
         await llm.complete([])
         await llm.complete([])
 
@@ -183,7 +183,7 @@ async def test_el_turno_cierra_con_la_latencia_acumulada(turno_con_modelo: None)
 async def test_un_turno_sin_modelo_cierra_sin_latencia(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def handle_flush(ctx: AppContext, identity: str, items: list[Any]) -> None:
+    async def handle_flush(ctx: AppContext, identity: str, items: list[Any], **_: Any) -> None:
         pass
 
     monkeypatch.setattr(dispatch, "handle_flush", handle_flush)
@@ -214,7 +214,7 @@ async def test_turnos_concurrentes_no_se_mezclan_la_latencia(
 ) -> None:
     lentos = {"dsp_rapido": _llm_lento(5), "dsp_lento": _llm_lento(80)}
 
-    async def handle_flush(ctx: AppContext, identity: str, items: list[Any]) -> None:
+    async def handle_flush(ctx: AppContext, identity: str, items: list[Any], **_: Any) -> None:
         await lentos[ctx.crm.despacho].complete([])
 
     monkeypatch.setattr(dispatch, "handle_flush", handle_flush)

@@ -66,7 +66,7 @@ def _ctx() -> AppContext:
 def turnos(monkeypatch: pytest.MonkeyPatch) -> list[AppContext]:
     vistos: list[AppContext] = []
 
-    async def handle_flush(ctx: AppContext, identity: str, items: list[Any]) -> None:
+    async def handle_flush(ctx: AppContext, identity: str, items: list[Any], **_: Any) -> None:
         vistos.append(ctx)
 
     monkeypatch.setattr(dispatch, "handle_flush", handle_flush)
