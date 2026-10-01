@@ -110,7 +110,3 @@ hasta verde. Prohibido delegar la prueba al dueño.
 
 Nuevas variables → `.env.example` con placeholder `REEMPLAZA_...` y guía
 inline. Jamás secretos en el repo ni en logs.
-
-## Trabajo autónomo en Codex
-
-Este espacio es la copia de trabajo Astra. El usuario autorizó implementar multitenancy, cobros Stripe y desplegar cambios en Vocero Cloud/dev. Resolver decisiones reversibles con el contexto disponible y completar pruebas y despliegue sin reconfirmaciones. No modificar producción ni otros proyectos. Mantener secretos fuera de chat, argv y Git. Los merges a main los realiza Kevin; se puede desplegar una rama de trabajo en dev. Leer specs y bitácora para retomar. Las instrucciones actuales del usuario prevalecen sobre procedimientos heredados.

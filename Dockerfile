@@ -11,6 +11,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY migrations ./migrations
+COPY scripts/live-security-test.py ./scripts/live-security-test.py
+
+RUN groupadd --gid 10001 nea && useradd --uid 10001 --gid nea --no-create-home --shell /usr/sbin/nologin nea
+USER 10001:10001
 
 # Qué versión corre, para /health (app/version.py). Van después del
 # `pip install` para no invalidar su caché en cada commit. El commit se

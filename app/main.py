@@ -24,6 +24,7 @@ from app.config import Settings
 from app.crm import CrmClient
 from app.crm_brains import BrainsCrmClient
 from app.dispatch import router as dispatch_router
+from app.dispatch_worker import run as run_dispatch_worker
 from app.db import PgStore
 from app.followup import FollowupWorker
 from app.llm import OpenAiLlm
@@ -244,6 +245,8 @@ def create_app(ctx: AppContext | None = None) -> FastAPI:
             asyncio.create_task(followup_worker.run(), name="followup-worker"),
             asyncio.create_task(sender_worker.run(), name="sender-worker"),
         ]
+        if c.settings.cloud_mode:
+            workers.append(asyncio.create_task(run_dispatch_worker(c), name="dispatch-worker"))
         # El relay reenvía al CRM el payload crudo de Meta. En cloud el CRM YA
         # tiene el mensaje —él lo recibió y él nos lo despachó—, así que
         # reenviárselo sería duplicarlo en la bandeja del cliente.
@@ -280,11 +283,12 @@ def create_app(ctx: AppContext | None = None) -> FastAPI:
     app.state.ctx = ctx
     if ctx is not None:
         _wire_coalescer(ctx)
-    app.include_router(webhook_router)
     # La entrada del despacho solo existe en cloud. Montarla siempre dejaría
     # una ruta pública de más en cada instalación que no la usa.
     if (ctx.settings if ctx is not None else Settings()).cloud_mode:
         app.include_router(dispatch_router)
+    else:
+        app.include_router(webhook_router)
 
     @app.get("/health")
     async def health(request: Request):  # type: ignore[no-untyped-def]

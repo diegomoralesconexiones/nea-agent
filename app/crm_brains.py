@@ -62,6 +62,7 @@ RUTAS_POR_PREFIJO = {
 
 
 class BrainsCrmClient(CrmClient):
+    media_path = "/api/brains/media/"
     def __init__(
         self,
         base_url: str,

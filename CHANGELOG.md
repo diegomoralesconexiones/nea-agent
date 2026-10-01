@@ -4,15 +4,19 @@ Qué cambia en cada versión de Nea y qué hacer al actualizar. Cada tag
 `vX.Y.Z` publica la imagen `ghcr.io/kevinrivm/nea-agent:X.Y.Z` (README,
 «Instalar»).
 
-## 1.0.0 — 2026-09-XX
+## 1.0.0 — 2026-09-30
 
 Primera versión con número y primera con imagen publicada. Hasta aquí Nea se
 instalaba construyendo `main`. Lo de abajo cuenta desde el `main` del 18-sep
-(`c90ec87`): los PR #27, #28, #29 y #30. Si tu copia es más vieja, lee también
+(`c90ec87`): los PR #27, #28, #29, #30 y #32. Si tu copia es más vieja, lee también
 el final de «Actualizar».
 
 > **¿Corres el modo estándar con un `main` de entre el 31-ago y el 21-sep?**
 > Tu Nea no le está pasando los mensajes al CRM. Actualiza (ver «Actualizar»).
+
+> **Modo estándar: `META_APP_SECRET` ahora es obligatoria.** Sin ella,
+> `POST /webhook` responde 401 y Nea deja de recibir mensajes. Ponla antes de
+> actualizar.
 
 ### Nuevo
 
@@ -43,6 +47,17 @@ el final de «Actualizar».
 
 ### Cambió
 
+- **`META_APP_SECRET` es obligatoria en modo estándar** (#32). Antes, vacía,
+  `/webhook` aceptaba cualquier POST sin firma: quien conociera la URL podía
+  hacerse pasar por un lead y hacer que Nea le contestara y gastara modelo.
+  Ahora, sin secreto o con la firma ausente o inválida, responde 401. En modo
+  cloud `/webhook` ya no se monta: la única entrada es el despacho firmado del
+  CRM.
+- **La imagen corre sin root** (#32): usuario `nea`, UID y GID 10001.
+- **Límites de entrada** (#32). El cuerpo de `/webhook` y del despacho, hasta
+  2 MiB (más, 413). La descarga de un adjunto, hasta 16 MiB y 30 s (antes,
+  60 s). El texto de un PDF se extrae en un proceso aparte, con 6 s de tope y
+  dos a la vez, para que un PDF pesado no frene los turnos de los demás.
 - **El candado de cierre se reabre** (#28). Antes, tras la despedida había
   24 h de silencio pasara lo que pasara: un «¿cuánto cuesta?» se quedaba sin
   respuesta. Ahora el relleno («gracias», «ok 👍») se sigue contestando con
@@ -101,12 +116,22 @@ el final de «Actualizar».
   mañana».
 - **El token del webhook del CRM ya no queda en el log de Nea** (#30). httpx
   escribía la URL de cada relay, con el token en la ruta.
+- **Modo cloud: un despacho confirmado ya no se pierde si Nea se cae** (#32).
+  Antes Nea respondía 200 al CRM con el turno solo en memoria. Ahora lo guarda
+  en `dispatch_inbox` antes de confirmar y un worker lo retoma al arrancar. Un
+  turno que se cortó a medias pasa a un humano en vez de repetirse, para no
+  mandarle dos veces lo mismo al lead.
 
 ### Actualizar
 
 Basta con correr la versión nueva: las migraciones se aplican solas y todas
 las variables nuevas traen default. En modo cloud no hay relay: los puntos 2
 y 6 no aplican.
+
+**Antes, en modo estándar: comprueba que `META_APP_SECRET` tenga el App
+Secret de tu app de Meta** (la misma del token). Si estaba vacía, desde esta
+versión `POST /webhook` responde 401 y en el log de Nea aparece
+`firma inválida o ausente en el webhook — 401`.
 
 1. **¿Qué versión corres?** Si tu `/health` no trae `version`, tu Nea es de
    antes del 22-sep. Si dice `dev`, se construyó sin los build args.
@@ -123,6 +148,8 @@ y 6 no aplican.
    mismas variables, la misma base y el mismo dominio. Detén la vieja antes de
    arrancar la nueva: dos Nea contra la misma base reenvían dos veces lo
    pendiente. No pongas `NEA_VERSION` en las variables y deja `PORT` en 8000.
+   La imagen corre como UID 10001: si montas el `BRIEF_PATH` desde un volumen,
+   que ese usuario pueda leerlo.
    Si prefieres construir, hazlo desde el tag `v1.0.0` con los build args del
    README.
 4. **Migraciones.** Se aplican solas al arrancar, antes de atender:
@@ -130,9 +157,13 @@ y 6 no aplican.
      (`BIGINT NOT NULL DEFAULT 0`).
    - `007_relay_ultimo_error.sql`: `relay_queue.last_error_at` y su índice
      parcial.
+   - `008_dispatch_inbox.sql`: la tabla `dispatch_inbox`. Solo la usa el modo
+     cloud; en modo estándar se queda vacía.
 
-   Son aditivas (`ADD COLUMN IF NOT EXISTS`): no borran ni reescriben datos.
-5. **Variables nuevas.** Ninguna es obligatoria:
+   Son aditivas (`ADD COLUMN IF NOT EXISTS`, `CREATE TABLE IF NOT EXISTS`): no
+   borran ni reescriben datos.
+5. **Variables nuevas.** Ninguna es obligatoria (la que cambió es
+   `META_APP_SECRET`, arriba):
 
    | Variable | Default | Antes |
    |---|---|---|

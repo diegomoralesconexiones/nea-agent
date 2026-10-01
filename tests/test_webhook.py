@@ -69,8 +69,8 @@ def test_verify_signature_pura():
     assert verify_signature(body, None, SECRET) is False
     assert verify_signature(body, "malformada", SECRET) is False
     # Sin secret configurado no se exige firma:
-    assert verify_signature(body, None, None) is True
-    assert verify_signature(body, "sha256=basura", None) is True
+    assert verify_signature(body, None, None) is False
+    assert verify_signature(body, "sha256=basura", None) is False
 
 
 # ------------------------------------------------------------- identidad ---
@@ -272,10 +272,11 @@ async def test_post_firma_ausente(signed_client):
     assert resp.status_code == 401
 
 
-async def test_post_sin_secret_no_exige_firma(ctx, client, respx_mock):
+async def test_post_sin_secret_rechaza(ctx, client, respx_mock):
+    ctx.settings.meta_app_secret = ""
     mock_crm_basics(respx_mock)
     resp = await client.post("/webhook", content=wa_body())
-    assert resp.status_code == 200
+    assert resp.status_code == 401
 
 
 # ---------------------------------------------------------------- dedup ---

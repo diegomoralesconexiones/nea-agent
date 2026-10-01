@@ -11,6 +11,8 @@ import itertools
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Protocol
+from contextlib import AbstractAsyncContextManager
+from app.dispatch_store import DispatchJob, MemoryDispatchStore
 
 if TYPE_CHECKING:
     from app.config import Settings
@@ -162,6 +164,9 @@ class InboundMessage:
 class Store(Protocol):
     """Contrato de persistencia del bot (Postgres real o memoria en tests)."""
 
+    async def enqueue_dispatch(self, org: str, payload: dict[str, Any]) -> None: ...
+    def claim_dispatch(self) -> AbstractAsyncContextManager[DispatchJob | None]: ...
+
     # dedup
     async def mark_processed(self, wa_message_id: str) -> bool:
         """True si el mensaje es nuevo (gana el INSERT); False si ya se procesó."""
@@ -246,7 +251,7 @@ class Store(Protocol):
 # ------------------------------------------------------- fake en memoria ---
 
 
-class MemoryStore:
+class MemoryStore(MemoryDispatchStore):
     """Implementación en memoria del Store — solo para tests."""
 
     def __init__(self) -> None:
@@ -496,6 +501,7 @@ class AppContext:
     organizacion: tuple[str, str] | None = None
     coalescer: Any | None = None
     relay_wake: asyncio.Event = field(default_factory=asyncio.Event)
+    dispatch_wake: asyncio.Event = field(default_factory=asyncio.Event)
     # ¿El CRM de esta instancia tiene motor de agenda? Vocero lo trae detrás de
     # una bandera de despliegue y viene apagado por defecto. Es lo que vale en
     # el turno en curso: el turno lo refresca al empezar desde `agenda_sonda`

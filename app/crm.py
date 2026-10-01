@@ -180,6 +180,7 @@ def canonical_handoff_reason(reason: str | None) -> str:
 
 
 class CrmClient:
+    media_path = "/api/bot/media/"
     def __init__(
         self,
         base_url: str,
@@ -427,13 +428,19 @@ class CrmClient:
 
         Devuelve (bytes, mime). Timeout amplio: los adjuntos pueden pesar.
         """
-        resp = await self._request(
-            "GET", f"/api/bot/media/{media_id}", timeout=60.0
-        )
-        if resp.status_code != 200:
-            raise CrmError(f"media devolvió {resp.status_code}")
-        mime = resp.headers.get("content-type") or "application/octet-stream"
-        return resp.content, mime
+        limit = 16 * 1024 * 1024
+        try:
+            async with self._http.stream("GET", f"{self.media_path}{media_id}", timeout=30.0) as resp:
+                if resp.status_code != 200:
+                    raise CrmError(f"media devolvió {resp.status_code}")
+                data = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    if len(data) + len(chunk) > limit:
+                        raise CrmError("media exceeds 16 MB")
+                    data.extend(chunk)
+                return bytes(data), resp.headers.get("content-type") or "application/octet-stream"
+        except httpx.HTTPError as exc:
+            raise CrmUnreachable("error de red descargando media") from exc
 
     async def aclose(self) -> None:
         await self._http.aclose()

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 from typing import Any
 
 import httpx
@@ -18,6 +20,26 @@ CRM_WEBHOOK_URL = "http://crm.test/api/webhooks/wa/tok-crm"
 
 IDENTITY = "525550001111"
 CRM_CONV_ID = "cv_test1"
+
+
+@pytest.fixture(autouse=True)
+def signed_meta_fixture(monkeypatch):
+    """The simulated Meta sender signs default-fixture events, as Meta does.
+    Security tests use a different or empty secret and remain fully explicit.
+    """
+    original = httpx.ASGITransport.handle_async_request
+
+    async def send(transport, request):
+        ctx = getattr(transport.app.state, "ctx", None)
+        if (ctx is not None and ctx.settings.meta_app_secret == "test-meta-event-signing"
+                and request.url.path == "/webhook" and request.method == "POST"
+                and "x-hub-signature-256" not in request.headers):
+            body = await request.aread()
+            request.headers["x-hub-signature-256"] = "sha256=" + hmac.new(
+                b"test-meta-event-signing", body, hashlib.sha256).hexdigest()
+        return await original(transport, request)
+
+    monkeypatch.setattr(httpx.ASGITransport, "handle_async_request", send)
 
 
 class FakeLLM:
@@ -54,7 +76,7 @@ class FakeLLM:
 def make_settings(**overrides: Any) -> Settings:
     values: dict[str, Any] = dict(
         verify_token="vtoken",
-        meta_app_secret="",
+        meta_app_secret="test-meta-event-signing",
         crm_base_url=CRM_URL,
         crm_webhook_url=CRM_WEBHOOK_URL,
         crm_bot_api_key="test-key",

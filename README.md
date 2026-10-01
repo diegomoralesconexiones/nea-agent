@@ -248,7 +248,9 @@ En Coolify, dentro del proyecto del CRM:
 
 No pongas `NEA_VERSION` en las variables: pisaría la de la imagen. Deja `PORT`
 en 8000: el HEALTHCHECK siempre pregunta a ese puerto. Y no dejes dos Nea
-contra la misma base: cada una reenviaría por su cuenta lo pendiente.
+contra la misma base: cada una reenviaría por su cuenta lo pendiente. La
+imagen corre sin root (UID 10001): si montas archivos, como el `BRIEF_PATH`,
+que ese usuario pueda leerlos.
 
 ¿Un fork u otra arquitectura? Construye tu imagen con los mismos build args;
 sin ellos, `/health` dice `"version": "dev"`:
@@ -269,7 +271,7 @@ dale a tu servidor credenciales del registro, o Coolify no podrá descargarlo.
 |---|---|---|
 | `DATABASE_URL` | El Postgres de Nea: `postgresql://usuario:clave@host:5432/nea` | Nea no arranca |
 | `VERIFY_TOKEN` | Un token que inventas tú. El mismo va en el override del webhook | Meta no puede verificar el webhook: `GET /webhook` da 403 |
-| `META_APP_SECRET` | El App Secret de tu app de Meta, el mismo del CRM | No se verifica la firma: cualquiera puede postear al webhook. Solo para desarrollo |
+| `META_APP_SECRET` | El App Secret de tu app de Meta, el mismo del CRM | `POST /webhook` responde 401 a todo: Nea no recibe mensajes |
 | `CRM_BASE_URL` | `https://crm.tu-negocio.com`, sin `/` al final | Apunta a `http://localhost:3000` |
 | `CRM_WEBHOOK_URL` | `https://crm.tu-negocio.com/api/webhooks/wa/<META_WEBHOOK_VERIFY_TOKEN del CRM>` | El relay no entrega nada: el CRM no ve los mensajes y a un contacto nuevo Nea no le contesta |
 | `CRM_BOT_API_KEY` | El `BOT_API_KEY` del CRM | El CRM contesta 401 y Nea no le contesta a nadie |
@@ -287,8 +289,9 @@ funcionando.
 ### 4. El webhook de Meta, a Nea
 
 Nea recibe a Meta en `https://nea.tu-dominio.com/webhook`: `GET` para la
-verificación (con tu `VERIFY_TOKEN`) y `POST` para los eventos (con
-`META_APP_SECRET` puesto, una firma inválida o ausente da 401).
+verificación (con tu `VERIFY_TOKEN`) y `POST` para los eventos (la firma de
+Meta es obligatoria: sin `META_APP_SECRET`, o con la firma inválida o ausente,
+da 401).
 
 Apúntalo con un **override a nivel del número de teléfono**. Meta busca a
 dónde mandar cada webhook en este orden: el override del número, el de la WABA
@@ -389,11 +392,14 @@ Requisitos: Python 3.11+, un Postgres propio y un Vocero CRM con lo del paso 1.
 git clone https://github.com/kevinrivm/nea-agent && cd nea-agent
 python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env                            # llena los REEMPLAZA_...
+cp .env.example .env                            # llena los REEMPLAZA_... y META_APP_SECRET
 uvicorn app.main:app --port 8000                # migraciones corren al arranque
 ```
 
-El webhook de Meta va a `GET|POST /webhook` con tu `VERIFY_TOKEN`.
+El webhook de Meta va a `GET|POST /webhook` con tu `VERIFY_TOKEN`. También en
+local la firma es obligatoria: sin `META_APP_SECRET` todo POST da 401, y un POST
+a mano tiene que llevar `x-hub-signature-256` calculada con ese secreto (como
+hace `scripts/e2e_contra_raiz.py`).
 
 ### Probar en seco
 

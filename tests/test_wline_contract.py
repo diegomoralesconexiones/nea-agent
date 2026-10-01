@@ -8,7 +8,6 @@ igual que siempre.
 """
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import hmac
 import json
@@ -19,6 +18,7 @@ import pytest
 
 import app.dispatch as dispatch
 from app.config import Settings
+from app.dispatch_worker import drain_one
 from app.main import create_app
 from app.state import AppContext, MemoryStore
 
@@ -33,7 +33,7 @@ def _firmar(cuerpo: bytes) -> str:
 def procesados(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     vistos: list[dict[str, Any]] = []
 
-    async def _procesar(ctx: AppContext, payload: dict[str, Any]) -> None:
+    async def _procesar(ctx: AppContext, payload: dict[str, Any], *, durable: bool = False) -> None:
         vistos.append(payload)
 
     monkeypatch.setattr(dispatch, "_procesar", _procesar)
@@ -41,17 +41,23 @@ def procesados(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
 
 
 @pytest.fixture
-async def nea():
+def ctx() -> AppContext:
     settings = Settings(
         _env_file=None, vocero_mode="cloud", crm_organization="principal", crm_brain_secret=SECRETO
     )
-    ctx = AppContext(settings=settings, store=MemoryStore(), crm=object(), llm=object())
+    return AppContext(settings=settings, store=MemoryStore(), crm=object(), llm=object())
+
+
+@pytest.fixture
+async def nea(ctx: AppContext):
     transport = httpx.ASGITransport(app=create_app(ctx=ctx))
     async with httpx.AsyncClient(transport=transport, base_url="http://nea.test") as c:
         yield c
 
 
-async def _despachar(nea: httpx.AsyncClient, extra: dict[str, Any]) -> httpx.Response:
+async def _despachar(
+    nea: httpx.AsyncClient, ctx: AppContext, extra: dict[str, Any]
+) -> httpx.Response:
     cuerpo = json.dumps(
         {
             "dispatchId": "dsp_1",
@@ -66,16 +72,17 @@ async def _despachar(nea: httpx.AsyncClient, extra: dict[str, Any]) -> httpx.Res
         content=cuerpo,
         headers={"content-type": "application/json", "x-vocero-signature": _firmar(cuerpo)},
     )
-    # El despacho se procesa en segundo plano, tras acusar recibo.
-    await asyncio.gather(*dispatch._bg_tasks)
+    # El despacho queda en el inbox durable y lo procesa el worker.
+    while await drain_one(ctx):
+        pass
     return resp
 
 
 @pytest.mark.parametrize("version", [2, 0, "1", "dos"])
 async def test_una_version_desconocida_es_409_y_no_se_procesa(
-    nea: httpx.AsyncClient, procesados: list[dict[str, Any]], version: Any
+    nea: httpx.AsyncClient, ctx: AppContext, procesados: list[dict[str, Any]], version: Any
 ) -> None:
-    resp = await _despachar(nea, {"contractVersion": version})
+    resp = await _despachar(nea, ctx, {"contractVersion": version})
 
     assert resp.status_code == 409
     assert resp.json() == {"error": {"code": "contrato_incompatible", "supported": [1]}}
@@ -83,17 +90,17 @@ async def test_una_version_desconocida_es_409_y_no_se_procesa(
 
 
 async def test_la_version_1_se_procesa(
-    nea: httpx.AsyncClient, procesados: list[dict[str, Any]]
+    nea: httpx.AsyncClient, ctx: AppContext, procesados: list[dict[str, Any]]
 ) -> None:
-    resp = await _despachar(nea, {"contractVersion": 1})
+    resp = await _despachar(nea, ctx, {"contractVersion": 1})
     assert resp.status_code == 200
     assert [p["dispatchId"] for p in procesados] == ["dsp_1"]
 
 
 async def test_sin_version_se_procesa_como_siempre(
-    nea: httpx.AsyncClient, procesados: list[dict[str, Any]]
+    nea: httpx.AsyncClient, ctx: AppContext, procesados: list[dict[str, Any]]
 ) -> None:
-    resp = await _despachar(nea, {})
+    resp = await _despachar(nea, ctx, {})
     assert resp.status_code == 200
     assert len(procesados) == 1
 

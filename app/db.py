@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import asyncpg
+from app.dispatch_store import PgDispatchStore
 
 from app.state import (
     COLUMNAS_DE_CONVERSACION,
@@ -102,7 +103,7 @@ def _pending_send_desde_fila(row: Any) -> PendingSend:
     )
 
 
-class PgStore:
+class PgStore(PgDispatchStore):
     """Store respaldado por Postgres (asyncpg)."""
 
     def __init__(self, dsn: str) -> None:

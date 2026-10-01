@@ -3,7 +3,7 @@
 Reglas duras:
 - El POST responde 200 en <1 s SIEMPRE; el procesamiento es asíncrono.
 - Firma `x-hub-signature-256` verificada si META_APP_SECRET está configurado
-  (inválida o ausente → 401). Sin secret → se acepta (dev).
+  (inválida o ausente → 401). Sin secret → se rechaza.
 - El body crudo se encola para el relay al CRM ANTES de cualquier parseo.
 - Dedup por `wa_message_id` (INSERT ... ON CONFLICT como gate atómico).
 - Identidad: la misma forma en que el CRM guarda al contacto — el teléfono
@@ -23,6 +23,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from app.config import canonical_identity
+from app.http_limits import limited_body
 from app.state import AppContext, InboundMessage
 
 logger = logging.getLogger("nea.webhook")
@@ -36,7 +37,7 @@ _bg_tasks: set[asyncio.Task[None]] = set()
 def verify_signature(body: bytes, header: str | None, secret: str | None) -> bool:
     """HMAC-SHA256 del body crudo contra el app secret de Meta."""
     if not secret:
-        return True  # sin secret configurado no se exige firma (dev)
+        return False
     if not header or not header.startswith("sha256="):
         return False
     expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
@@ -207,7 +208,7 @@ async def verify(request: Request) -> PlainTextResponse:
 async def receive(request: Request) -> Any:
     """200 inmediato; todo el trabajo real corre en una tarea de fondo."""
     ctx: AppContext = request.app.state.ctx
-    body = await request.body()
+    body = await limited_body(request)
     signature = request.headers.get("x-hub-signature-256")
     if not verify_signature(body, signature, ctx.settings.meta_app_secret or None):
         logger.warning("firma inválida o ausente en el webhook — 401")

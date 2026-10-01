@@ -81,6 +81,7 @@ pytestmark = pytest.mark.skipif(
 # Todas las tablas de Nea. Si una migración añade otra, va aquí: si no, sus
 # filas sobrevivirían de una prueba a la siguiente.
 TABLAS = (
+    "dispatch_inbox",
     "bot_message",
     "offered_slots",
     "pending_send",
@@ -848,3 +849,36 @@ async def test_ping_y_cierre(base_de_prueba):
     await s.ping()
     await s.aclose()
     await s.aclose()  # cerrar dos veces no truena
+
+
+async def test_dispatch_commit_duplicate_recovery_and_concurrent_owner(store):
+    from tests.test_dispatch_durable import payload
+    body = payload()
+    await asyncio.gather(*(store.enqueue_dispatch("org_a", body) for _ in range(8)))
+    assert await store.pool.fetchval("select count(*) from dispatch_inbox") == 1
+    async with store.claim_dispatch() as first:
+        assert first and not first.recovery
+        async with store.claim_dispatch() as other:
+            assert other is None
+        await first.heartbeat()
+    # The process died after effects started; expiry alone cannot replay it.
+    await store.pool.execute("update dispatch_inbox set available_at=now()-interval '1 second'")
+    async with store.claim_dispatch() as recovered:
+        assert recovered and recovered.recovery
+        await recovered.finish()
+    async with store.claim_dispatch() as empty:
+        assert empty is None
+
+
+async def test_dispatch_queued_survives_new_store_instance(store):
+    from tests.test_dispatch_durable import payload
+    await store.enqueue_dispatch("org_a", payload())
+    replacement = PgStore(store._dsn)
+    await replacement.connect()
+    try:
+        async with replacement.claim_dispatch() as job:
+            assert job and not job.recovery
+            assert job.payload["dispatchId"] == "dsp_durable"
+            await job.finish()
+    finally:
+        await replacement.aclose()

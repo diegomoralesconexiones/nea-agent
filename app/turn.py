@@ -181,6 +181,7 @@ async def handle_flush(
     crm_conversation_id: str | None = None,
     *,
     reintento: _Pendiente | None = None,
+    propagate_errors: bool = False,
 ) -> None:
     """Callback del coalescer (y del despacho en cloud) — nunca propaga excepciones.
 
@@ -235,8 +236,12 @@ async def handle_flush(
             try:
                 await run_turn(ctx, identity, items, turno)
             except TurnoSinCrm as exc:
+                if propagate_errors:
+                    raise
                 _reprogramar(ctx, identity, items, fallas + 1, turno, str(exc))
     except Exception:
+        if propagate_errors:
+            raise
         wamids = [
             str(w) for w in (getattr(m, "wa_message_id", None) for m in items) if w
         ]

@@ -18,6 +18,7 @@ import respx
 import app.dispatch as dispatch
 from app.config import Settings
 from app.crm_brains import BrainsCrmClient
+from app.dispatch_worker import drain_one
 from app.llm import LlmReply, OpenAiLlm, medir_turno
 from app.state import AppContext, MemoryStore
 
@@ -199,6 +200,29 @@ async def test_un_turno_que_revienta_cierra_igual_con_el_error() -> None:
     assert len(crm.cierres) == 1
     _, _, error = crm.cierres[0]
     assert error is not None and "RuntimeError" in error
+
+
+async def test_en_el_inbox_durable_cierra_y_ademas_pasa_a_humano() -> None:
+    """Merge con upstream (despacho durable): el cierre de Wline (N7) y el pase
+    a humano del worker conviven; el turno no se repite."""
+
+    class CrmConHandoff(CrmQueAnota):
+        def __init__(self) -> None:
+            super().__init__(revienta=True)
+            self.handoffs: list[tuple[str, str]] = []
+
+        async def post_handoff(self, conversation_id: str, motivo: str) -> None:
+            self.handoffs.append((conversation_id, motivo))
+
+    crm = CrmConHandoff()
+    ctx = _ctx(crm)
+    await ctx.store.enqueue_dispatch("principal", _payload())
+
+    assert await drain_one(ctx)
+
+    assert len(crm.cierres) == 1 and "RuntimeError" in (crm.cierres[0][2] or "")
+    assert crm.handoffs == [(CONV, "error")]
+    assert not await drain_one(ctx)
 
 
 async def test_un_despacho_repetido_no_cierra_el_original(turno_con_modelo: None) -> None:
