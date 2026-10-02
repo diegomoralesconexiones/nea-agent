@@ -1,0 +1,106 @@
+/* Panel del agente (Wline 025). Tema oscuro y acento de Wline. Sin estilos
+   inline: la CSP (default-src 'self') no los permite. */
+:root {
+  color-scheme: dark;
+  --fondo: #0f1115;
+  --tarjeta: #171a21;
+  --campo: #0b0d11;
+  --borde: #2a2f3a;
+  --texto: #e6e8eb;
+  --tenue: #9aa3b2;
+  --acento: #38b763;
+  --peligro: #f26d6d;
+  --aviso: #e5b74c;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+body {
+  margin: 0;
+  background: var(--fondo);
+  color: var(--texto);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+a { color: var(--acento); }
+h1 { font-size: 1.4rem; margin: 0; }
+h2 { font-size: 1.15rem; margin: 0 0 .25rem; color: var(--acento); }
+h3 { font-size: 1rem; margin: 1.25rem 0 .5rem; }
+.tenue { color: var(--tenue); margin: .25rem 0; }
+
+.cabecera, .indice, .avisos, main { max-width: 960px; margin-left: auto; margin-right: auto; }
+.cabecera { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; padding: 1.25rem 1rem .5rem; }
+.indice { display: flex; flex-wrap: wrap; gap: .25rem .9rem; padding: 0 1rem .75rem; }
+.indice a { text-decoration: none; font-size: .9rem; }
+.avisos { display: grid; gap: .5rem; padding: 0 1rem; margin-bottom: 1rem; }
+main { display: grid; gap: 1rem; padding: 0 1rem 4rem; }
+
+.seccion { background: var(--tarjeta); border: 1px solid var(--borde); border-radius: 10px; padding: 1rem 1.25rem; scroll-margin-top: 1rem; }
+
+.campo { display: grid; gap: .25rem; margin: .6rem 0; }
+.campo > span { font-size: .9rem; color: var(--tenue); }
+.campo small { color: var(--tenue); font-size: .8rem; }
+.campo.vacio > span::after { content: " · vacío"; color: var(--aviso); }
+
+input, textarea, select {
+  width: 100%;
+  background: var(--campo);
+  color: var(--texto);
+  border: 1px solid var(--borde);
+  border-radius: 6px;
+  padding: .5rem .6rem;
+  font: inherit;
+}
+input[type="checkbox"] { width: auto; }
+textarea { resize: vertical; min-height: 2.5rem; }
+input:focus, textarea:focus, select:focus, button:focus-visible { outline: 2px solid var(--acento); outline-offset: 1px; }
+
+button {
+  background: transparent;
+  color: var(--texto);
+  border: 1px solid var(--borde);
+  border-radius: 6px;
+  padding: .45rem .8rem;
+  font: inherit;
+  cursor: pointer;
+}
+button:hover:not(:disabled) { border-color: var(--acento); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+button.primario { background: var(--acento); border-color: var(--acento); color: #0b1a10; font-weight: 600; }
+button.quitar { color: var(--peligro); }
+
+.pie { display: flex; align-items: center; flex-wrap: wrap; gap: .75rem; margin-top: 1rem; padding-top: .75rem; border-top: 1px solid var(--borde); }
+.acciones { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .5rem; }
+.mensaje { margin: 0; }
+.mensaje.ok { color: var(--acento); }
+.mensaje.error { color: var(--peligro); }
+
+.aviso { margin: .5rem 0; padding: .6rem .8rem; border-left: 3px solid var(--aviso); background: rgba(229, 183, 76, .08); border-radius: 4px; }
+.peligro { margin: .5rem 0; padding: .6rem .8rem; border-left: 3px solid var(--peligro); background: rgba(242, 109, 109, .1); border-radius: 4px; color: var(--peligro); }
+
+.etiqueta { display: inline-block; font-size: .75rem; font-weight: 400; padding: .1rem .5rem; border-radius: 999px; border: 1px solid var(--borde); color: var(--tenue); vertical-align: middle; }
+.etiqueta.pendiente { border-color: var(--aviso); color: var(--aviso); }
+.etiqueta.ok { border-color: var(--acento); color: var(--acento); }
+.etiqueta.atencion { border-color: var(--peligro); color: var(--peligro); }
+
+.entradas, .cadena { padding-left: 1.25rem; margin: 0; display: grid; gap: .75rem; }
+.entrada, .eslabon, .tipo, .tarjeta, .campo-ficha { border: 1px solid var(--borde); border-radius: 8px; padding: .75rem; }
+.tipo, .tarjeta { margin: .75rem 0; }
+.tipo h3, .tarjeta h3 { margin: 0 0 .25rem; }
+.campo-ficha { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .5rem; align-items: end; margin: .5rem 0; }
+.campo-ficha .campo { margin: 0; }
+.campo-ficha.sistema { display: block; }
+.check { display: flex; align-items: center; gap: .4rem; margin: .4rem 0; }
+.mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .85rem; }
+.rejilla { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0 .75rem; }
+
+.tabla { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+th, td { text-align: left; padding: .45rem .5rem; border-bottom: 1px solid var(--borde); vertical-align: top; }
+th { color: var(--tenue); font-weight: 500; }
+
+@media (max-width: 600px) {
+  .cabecera { flex-direction: column; }
+  .seccion { padding: .9rem; }
+}

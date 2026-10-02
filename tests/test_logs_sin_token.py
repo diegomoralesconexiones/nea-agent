@@ -52,3 +52,35 @@ def test_el_relay_real_no_deja_el_token_en_el_log(caplog: pytest.LogCaptureFixtu
         httpx.post(url, content=b"{}")
     assert "s3cr3t-del-webhook" not in caplog.text
     assert "/api/webhooks/wa/***" in caplog.text
+
+
+# ── Wline (025): la llave de una plataforma tampoco (FR-041, SC-014) ──────
+
+from tests.test_panel_publicar import _nea, pool  # noqa: E402,F401
+from tests.test_pg_store import TEST_DATABASE_URL, base_de_prueba  # noqa: E402,F401
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="sin TEST_DATABASE_URL: el panel guarda en Postgres")
+async def test_la_llave_de_una_plataforma_no_llega_a_logs_ni_respuestas(
+    pool, respx_mock, caplog: pytest.LogCaptureFixture  # noqa: F811
+) -> None:
+    llave = "sk-or-secreta-larga-1234"
+    respx_mock.post("https://plataforma.test/v1/chat/completions").mock(
+        return_value=httpx.Response(400, json={"error": {"message": f"la clave {llave} no vale aquí"}})
+    )
+    respuestas: list[str] = []
+    with caplog.at_level(logging.DEBUG):
+        async with _nea(pool) as nea:
+            alta = await nea.pedir(
+                "POST", "/panel/api/plataformas",
+                {"nombre": "OpenRouter", "baseUrl": "https://plataforma.test/v1", "llave": llave},
+            )
+            pid = alta.json()["id"]
+            prueba = await nea.pedir("POST", f"/panel/api/plataformas/{pid}/probar", {"modelo": "m1", "extras": {}})
+            lista = await nea.pedir("GET", "/panel/api/plataformas")
+            respuestas += [alta.text, prueba.text, lista.text]
+    assert prueba.json()["motivo"] == "rechazo"
+    assert lista.json()[0]["ultimoError"]  # el error quedó anotado, saneado
+    assert lista.json()[0]["llave"] == "…1234"
+    assert llave not in caplog.text
+    assert all(llave not in texto for texto in respuestas)

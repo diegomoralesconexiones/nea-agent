@@ -25,6 +25,7 @@ from app.crm import CrmClient
 from app.crm_brains import BrainsCrmClient
 from app.dispatch import router as dispatch_router
 from app.dispatch_worker import run as run_dispatch_worker
+from app.panel import montar as montar_panel
 from app.db import PgStore
 from app.followup import FollowupWorker
 from app.llm import OpenAiLlm
@@ -285,8 +286,13 @@ def create_app(ctx: AppContext | None = None) -> FastAPI:
         _wire_coalescer(ctx)
     # La entrada del despacho solo existe en cloud. Montarla siempre dejaría
     # una ruta pública de más en cada instalación que no la usa.
-    if (ctx.settings if ctx is not None else Settings()).cloud_mode:
+    ajustes = ctx.settings if ctx is not None else Settings()
+    if ajustes.cloud_mode:
         app.include_router(dispatch_router)
+        # Wline (025): el panel del agente, detrás de la firma de Wline. Solo
+        # con un negocio fijo: habla con el CRM de esa organización.
+        if not ajustes.multi_org:
+            montar_panel(app)
     else:
         app.include_router(webhook_router)
 

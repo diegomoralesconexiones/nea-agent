@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Panel del agente</title>
+<link rel="stylesheet" href="/panel/static/panel.css">
+</head>
+<body>
+<header class="cabecera">
+  <div>
+    <h1>Panel del agente</h1>
+    <p id="vigente" class="tenue">Cargando…</p>
+  </div>
+  <a href="/inbox">Volver a Wline</a>
+</header>
+<nav class="indice" aria-label="Secciones del panel">
+  <a href="#identidad">Identidad</a>
+  <a href="#instrucciones">Instrucciones y escalado</a>
+  <a href="#conocimiento">Conocimiento</a>
+  <a href="#tipos">Tipos de cliente</a>
+  <a href="#reglas">Reglas del CRM</a>
+  <a href="#plataformas">Plataformas y cadena</a>
+  <a href="#historial">Historial</a>
+</nav>
+<div id="avisos" class="avisos" role="status" aria-live="polite"></div>
+<main>
+  <section id="identidad" class="seccion">
+    <h2>Identidad</h2>
+    <p class="tenue">Cómo se presenta el agente.</p>
+    <div class="cuerpo"></div>
+  </section>
+  <section id="instrucciones" class="seccion">
+    <h2>Instrucciones y escalado</h2>
+    <p class="tenue">Qué hace el agente y cuándo pasa la conversación a una persona.</p>
+    <div class="cuerpo"></div>
+  </section>
+  <section id="conocimiento" class="seccion">
+    <h2>Conocimiento</h2>
+    <p class="tenue">Lo que el agente sabe del negocio. Solo responde con esto.</p>
+    <div class="cuerpo"></div>
+  </section>
+  <section id="tipos" class="seccion">
+    <h2>Tipos de cliente</h2>
+    <p class="tenue">Los tipos se crean en Wline (Pipeline). Aquí se describe cómo reconocer y cómo atender a cada uno.</p>
+    <div class="cuerpo"></div>
+  </section>
+  <section id="reglas" class="seccion">
+    <h2>Reglas del CRM</h2>
+    <p class="tenue">Wline las hace cumplir: lo que el agente anota en la ficha, cuándo entra una persona y qué puede hacer.</p>
+    <div class="cuerpo"></div>
+  </section>
+  <section id="plataformas" class="seccion">
+    <h2>Plataformas y cadena</h2>
+    <p class="tenue">Las plataformas del modelo y el orden en que el agente las usa. Las llaves se guardan cifradas y solo se muestran sus últimos 4 caracteres.</p>
+    <div class="lista-plataformas"></div>
+    <h3>Cadena de respaldo</h3>
+    <div id="cadena"><div class="cuerpo"></div></div>
+  </section>
+  <section id="historial" class="seccion">
+    <h2>Historial</h2>
+    <p class="tenue">Cada publicación es una versión. Restaurar publica la versión elegida como una nueva.</p>
+    <div class="cuerpo"></div>
+  </section>
+</main>
+<script src="/panel/static/panel.js"></script>
+</body>
+</html>
