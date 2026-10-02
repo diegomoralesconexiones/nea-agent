@@ -11,3 +11,4 @@ openai==2.54.0
 pydantic-settings==2.15.0
 tzdata==2026.4
 pypdf==6.19.0
+cryptography==50.0.2
