@@ -74,3 +74,7 @@ CREATE TABLE IF NOT EXISTS cadena_prueba (
   lab_run_id text,
   vence_en timestamptz NOT NULL
 );
+
+-- El modelo que respondió en los turnos de la certificación (F15): lo anota
+-- la cadena de prueba y, al cerrar, pasa a `certificacion.modelo_respondio`.
+ALTER TABLE cadena_prueba ADD COLUMN IF NOT EXISTS modelo_respondio text;

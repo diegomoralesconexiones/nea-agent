@@ -324,6 +324,8 @@ async def test_la_cadena_de_prueba_solo_en_turnos_de_prueba_y_antes_de_vencer(po
     assert _eslabones(normal.cadena) == [("pl_a", "m1")]
     assert _eslabones(prueba.cadena) == [("pl_c", "candidato")]  # sin certificar: se está certificando
     assert prueba.cadena.eslabones[0].modelo_certificado is None
+    # Solo la cadena de prueba anota el modelo que respondió (plan-bloque5 D1).
+    assert (prueba.cadena._prueba, normal.cadena._prueba) == (True, False)
 
     await pool.execute("UPDATE cadena_prueba SET vence_en = now() - interval '1 second'")
     vencida = await preparar_contexto(pool, ORG, contexto(), _settings(), es_prueba=True)

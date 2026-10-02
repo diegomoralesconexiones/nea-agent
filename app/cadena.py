@@ -113,11 +113,19 @@ async def anotar_resultado(
 
 class LlmCadena:
     def __init__(
-        self, eslabones: list[Eslabon], *, pool: Any = None, organization_id: str = ""
+        self,
+        eslabones: list[Eslabon],
+        *,
+        pool: Any = None,
+        organization_id: str = "",
+        prueba: bool = False,
     ) -> None:
         self.eslabones = eslabones
         self._pool = pool
         self._org = organization_id
+        # La cadena de prueba de una certificación (R8): anota qué modelo
+        # respondió, para guardarlo con la certificación (F15).
+        self._prueba = prueba
         # Plataformas caídas en ESTE turno: la cadena se arma por turno.
         self._caidas: set[str] = set()
 
@@ -151,6 +159,8 @@ class LlmCadena:
                 traza.update(plataforma=e.plataforma.nombre, modelo=e.modelo, modeloRespondio=reply.model or "")
                 await anotar_resultado(self._pool, self._org, e.plataforma.id, None)
                 await self._vigilar_modelo(e, reply.model)
+                if self._prueba and reply.model:
+                    await self._anotar_modelo_de_prueba(reply.model)
                 return reply
         raise LlmExhausted("ningún eslabón de la cadena respondió")
 
@@ -189,6 +199,17 @@ class LlmCadena:
             )
         except Exception:
             logger.exception("no pude marcar el eslabón %s/%s", e.plataforma.id, e.modelo)
+
+    async def _anotar_modelo_de_prueba(self, modelo: str) -> None:
+        if self._pool is None:
+            return
+        try:
+            await self._pool.execute(
+                "UPDATE cadena_prueba SET modelo_respondio = $2 WHERE organization_id = $1",
+                self._org, modelo,
+            )
+        except Exception:
+            logger.exception("no pude anotar el modelo de la cadena de prueba")
 
     async def transcribe(self, data: bytes, mime: str, filename: str = "audio.ogg") -> str:
         # Sin cambio frente a hoy: con Wline no se transcribe (R6).

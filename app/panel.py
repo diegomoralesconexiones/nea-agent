@@ -20,7 +20,7 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -32,7 +32,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from app import cadena
 from app.cadena import Plataforma
-from app.configuracion import SinLlaveDeCifrado, _json, cifrar, descifrar
+from app.configuracion import SinLlaveDeCifrado, _json, _kb, cifrar, descifrar
 from app.crm import CrmConflict, CrmError
 
 logger = logging.getLogger("nea.panel")
@@ -80,9 +80,9 @@ def firma_esperada(secreto: str, metodo: str, ruta: str, resumen: str, cabecera:
 
 
 def rol_permitido(rol: str, metodo: str, ruta: str) -> bool:
-    """Propietario y Admin (FR-003); `sistema` solo para el juez del Laboratorio (R11)."""
-    if rol == "sistema":
-        return metodo == "GET" and ruta == "/panel/api/juez"
+    """Propietario y Admin (FR-003); el juez del Laboratorio, solo `sistema` (R11)."""
+    if ruta == "/panel/api/juez" or rol == "sistema":
+        return rol == "sistema" and metodo == "GET" and ruta == "/panel/api/juez"
     return rol in ("owner", "admin")
 
 
@@ -436,9 +436,7 @@ async def _guardar(
     """Publica la vigente con estas secciones encima. Con el candado tomado."""
     pool, org = ctx.store.pool, quien.organizacion
     avisos = list(avisos or [])
-    vig = await _vigente(pool, org)
-    if vig is None:
-        raise ErrorPanel(409, "sin_version", "Abre el panel para migrar la configuración antes de guardar")
+    vig, _ = await _migrar_si_falta(pool, org, auto)
     if base is not None and base != vig["numero"]:
         await _conflicto(pool, org, base, vig["numero"], secciones)
     actual = _json(vig["contenido"])
@@ -505,6 +503,24 @@ def _desde_wline(auto: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     return contenido, avisos
 
 
+async def _migrar_si_falta(pool: Any, org: str, auto: dict[str, Any]) -> tuple[Any, list[str]]:
+    """La vigente; sin ninguna versión, crea la 1 «migración» con lo que tiene
+    Wline (R17), sin publicar: las reglas ya están allá. Re-ejecutable."""
+    vig = await _vigente(pool, org)
+    if vig is not None:
+        return vig, []
+    contenido, avisos = _desde_wline(auto)
+    await pool.execute(
+        """INSERT INTO agente_version (organization_id, numero, contenido, resumen, autor_id, autor_correo)
+           VALUES ($1, 1, $2, 'migración', $3, $4) ON CONFLICT DO NOTHING""",
+        org, json.dumps(contenido), *MIGRACION,
+    )
+    await pool.execute(
+        "INSERT INTO agente_vigente (organization_id, numero) VALUES ($1, 1) ON CONFLICT DO NOTHING", org
+    )
+    return await _vigente(pool, org), avisos
+
+
 async def _plataformas(pool: Any, org: str) -> list[dict[str, Any]]:
     filas = await pool.fetch(
         """SELECT id, nombre, base_url, llave_ultimos4, ultimo_exito_en, ultimo_error, ultimo_error_en
@@ -546,20 +562,7 @@ async def estado(request: Request, quien: Quien = Depends(firma)) -> dict[str, A
     pool, org = ctx.store.pool, quien.organizacion
     async with _candado(request):
         auto = await _automation(ctx.crm)
-        avisos: list[str] = []
-        vig = await _vigente(pool, org)
-        if vig is None:
-            contenido, avisos = _desde_wline(auto)
-            # Sin publicar: las reglas ya están en Wline. Re-ejecutable.
-            await pool.execute(
-                """INSERT INTO agente_version (organization_id, numero, contenido, resumen, autor_id, autor_correo)
-                   VALUES ($1, 1, $2, 'migración', $3, $4) ON CONFLICT DO NOTHING""",
-                org, json.dumps(contenido), *MIGRACION,
-            )
-            await pool.execute(
-                "INSERT INTO agente_vigente (organization_id, numero) VALUES ($1, 1) ON CONFLICT DO NOTHING", org
-            )
-            vig = await _vigente(pool, org)
+        vig, avisos = await _migrar_si_falta(pool, org, auto)
         contenido = _json(vig["contenido"])
 
         claves = {str(linea.get("key")) for linea in auto.get("lines") or []}
@@ -583,7 +586,9 @@ async def estado(request: Request, quien: Quien = Depends(firma)) -> dict[str, A
                 f"El umbral «{umbral}» ya no existe en todas las líneas; el agente aplica Clasificado. "
                 "Elige otro en Reglas del CRM."
             )
+        certificando = await _certificacion_pendiente(ctx, org)
         return {
+            "certificando": certificando,
             "vigente": {
                 "numero": vig["numero"], "contenido": contenido,
                 "autor": vig["autor_correo"], "fecha": _iso(vig["creada_en"]),
@@ -686,12 +691,181 @@ async def conocimiento(request: Request, quien: Quien = Depends(firma)) -> dict[
         if not valor.strip():
             raise _invalido(f"Falta la {donde}")
     async with _candado(request):
-        vig = await _vigente(ctx.store.pool, quien.organizacion)
-        actual = (_json(vig["contenido"]).get("conocimiento") or []) if vig else []
+        auto = await _automation(ctx.crm)
+        vig, _ = await _migrar_si_falta(ctx.store.pool, quien.organizacion, auto)
+        actual = _json(vig["contenido"]).get("conocimiento") or []
         nuevo = [*actual, {"tipo": "qa", "pregunta": pregunta.strip(), "respuesta": respuesta.strip()}]
         _validar("conocimiento", nuevo, set())
-        auto = await _automation(ctx.crm)
         return await _guardar(ctx, quien, {"conocimiento": nuevo}, auto, resumen="conocimiento")
+
+
+# ── Certificación de eslabones (T064, R8; plan-bloque5 D1–D3) ────────────
+#
+# «Certificar» deja una cadena de prueba de un eslabón y le pide a Wline una
+# corrida del Laboratorio. Mientras exista, TODO turno de prueba (isTest)
+# piensa con ella. Al terminar la corrida: aprobada si no hubo ningún `rojo`
+# ni `judge_failed` (A1); se guarda con el modelo que respondió (F15).
+
+# El tope del Laboratorio (20 min, Wline T108) más uno: la corrida termina, o
+# el runner la falla, antes de que la cadena de prueba venza.
+VIGENCIA_PRUEBA = timedelta(minutes=21)
+
+
+def _mensaje_de_wline(exc: CrmConflict, por_defecto: str) -> str:
+    error = exc.payload.get("error")
+    return str((error.get("message") if isinstance(error, dict) else None) or por_defecto)
+
+
+async def _cerrar_certificacion(pool: Any, org: str, prueba: Any, corrida: dict[str, Any]) -> bool:
+    """Guarda el resultado de una corrida terminada y borra la cadena de prueba.
+
+    Una corrida `failed` (tope o error del runner) no evaluó al modelo: no se
+    guarda nada y la certificación anterior, si había, queda como estaba.
+    """
+    eslabon = _json(prueba["eslabon"])
+    casos = corrida.get("cases") or []
+    aprobada = corrida.get("status") == "done" and bool(casos) and not any(
+        c.get("veredicto") == "rojo" or c.get("status") == "judge_failed" for c in casos
+    )
+    if corrida.get("status") == "done":
+        try:
+            await pool.execute(
+                """INSERT INTO certificacion (organization_id, plataforma_id, modelo, extras, lab_run_id,
+                                              puntaje, aprobada, modelo_respondio, requiere_atencion, certificada_en)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, now())
+                   ON CONFLICT (organization_id, plataforma_id, modelo) DO UPDATE SET
+                     extras = EXCLUDED.extras, lab_run_id = EXCLUDED.lab_run_id, puntaje = EXCLUDED.puntaje,
+                     aprobada = EXCLUDED.aprobada, modelo_respondio = EXCLUDED.modelo_respondio,
+                     requiere_atencion = false, certificada_en = now()""",
+                org, eslabon["plataforma_id"], eslabon["modelo"], json.dumps(eslabon.get("extras") or {}),
+                prueba["lab_run_id"], corrida.get("score"), aprobada, prueba["modelo_respondio"],
+            )
+        except asyncpg.ForeignKeyViolationError:
+            aprobada = False  # la plataforma se borró mientras tanto
+    await pool.execute(
+        "DELETE FROM cadena_prueba WHERE organization_id = $1 AND lab_run_id = $2", org, prueba["lab_run_id"]
+    )
+    logger.info("panel: certificación %s de %s/%s: %s", prueba["lab_run_id"], eslabon["plataforma_id"],
+                eslabon["modelo"], "aprobada" if aprobada else "no aprobada")
+    return aprobada
+
+
+async def _certificacion_pendiente(ctx: Any, org: str) -> dict[str, Any] | None:
+    """Al abrir: cierra la certificación cuya corrida ya terminó (p. ej. si se
+    cerró la página); si sigue en curso, la devuelve para mostrar «certificando…»."""
+    pool = ctx.store.pool
+    prueba = await pool.fetchrow("SELECT * FROM cadena_prueba WHERE organization_id = $1", org)
+    if prueba is None or not prueba["lab_run_id"]:
+        return None
+    try:
+        corrida = await ctx.crm.lab_run_get(prueba["lab_run_id"])
+    except CrmError:
+        corrida = {}  # no impide abrir el panel; se cierra en la siguiente
+    if corrida.get("status") in ("done", "failed"):
+        await _cerrar_certificacion(pool, org, prueba, corrida)
+        return None
+    eslabon = _json(prueba["eslabon"])
+    return {
+        "plataformaId": eslabon["plataforma_id"], "modelo": eslabon["modelo"],
+        "extras": eslabon.get("extras") or {}, "runId": prueba["lab_run_id"],
+    }
+
+
+@router.post("/api/certificaciones", status_code=202)
+async def certificar(request: Request, quien: Quien = Depends(firma)) -> dict[str, Any]:
+    ctx = request.app.state.ctx
+    pool, org = ctx.store.pool, quien.organizacion
+    datos = await cuerpo_firmado(request)
+    if not isinstance(datos, dict):
+        raise _invalido("Se espera {plataforma_id, modelo, extras}")
+    async with _candado(request):
+        _validar("cadena", [datos], await _ids_de_plataformas(pool, org))
+        eslabon = {
+            "plataforma_id": datos["plataforma_id"], "modelo": datos["modelo"].strip(),
+            "extras": datos.get("extras") or {},
+        }
+        if await pool.fetchval(
+            "SELECT 1 FROM cadena_prueba WHERE organization_id = $1 AND vence_en > now()", org
+        ):
+            raise ErrorPanel(409, "laboratorio_ocupado", "Ya hay una certificación en curso: espera a que termine.")
+        # Primero la cadena de prueba: los turnos de la corrida la usan desde el primero.
+        await pool.execute(
+            """INSERT INTO cadena_prueba (organization_id, eslabon, vence_en) VALUES ($1, $2, now() + $3)
+               ON CONFLICT (organization_id) DO UPDATE SET eslabon = EXCLUDED.eslabon,
+                 vence_en = EXCLUDED.vence_en, lab_run_id = NULL, modelo_respondio = NULL""",
+            org, json.dumps(eslabon), VIGENCIA_PRUEBA,
+        )
+        try:
+            run_id = await ctx.crm.lab_run_start()
+        except CrmError as exc:
+            await pool.execute("DELETE FROM cadena_prueba WHERE organization_id = $1", org)
+            if isinstance(exc, CrmConflict):
+                if exc.code == "run_in_progress":
+                    raise ErrorPanel(
+                        409, "laboratorio_ocupado", "El Laboratorio ya tiene una corrida en curso: espera a que termine."
+                    ) from None
+                raise ErrorPanel(409, exc.code, _mensaje_de_wline(exc, "Wline no arrancó la corrida")) from None
+            raise ErrorPanel(502, "wline_inalcanzable", "No pude pedirle la corrida a Wline; no quedó nada pendiente.") from None
+        await pool.execute("UPDATE cadena_prueba SET lab_run_id = $2 WHERE organization_id = $1", org, run_id)
+    logger.info("panel: certificando %s/%s en la corrida %s", eslabon["plataforma_id"], eslabon["modelo"], run_id)
+    return {"runId": run_id}
+
+
+@router.get("/api/certificaciones/{run_id}")
+async def avance(run_id: str, request: Request, quien: Quien = Depends(firma)) -> dict[str, Any]:
+    """El avance (lo consulta la página solo mientras está abierta); al terminar, el resultado."""
+    ctx = request.app.state.ctx
+    pool, org = ctx.store.pool, quien.organizacion
+    async with _candado(request):
+        prueba = await pool.fetchrow(
+            "SELECT * FROM cadena_prueba WHERE organization_id = $1 AND lab_run_id = $2", org, run_id
+        )
+        cert = await pool.fetchrow(
+            "SELECT aprobada FROM certificacion WHERE organization_id = $1 AND lab_run_id = $2", org, run_id
+        )
+        if prueba is None and cert is None:
+            raise ErrorPanel(404, "no_encontrada", "Esa corrida no es una certificación de este panel")
+        try:
+            corrida = await ctx.crm.lab_run_get(run_id)
+        except CrmError:
+            raise ErrorPanel(502, "wline_inalcanzable", "No pude consultar la corrida en Wline.") from None
+        respuesta: dict[str, Any] = {
+            "status": corrida.get("status"), "progress": corrida.get("progress"), "score": corrida.get("score"),
+        }
+        if respuesta["status"] in ("done", "failed"):
+            respuesta["aprobada"] = (
+                await _cerrar_certificacion(pool, org, prueba, corrida) if prueba is not None
+                else bool(cert and cert["aprobada"])
+            )
+        return respuesta
+
+
+# ── El juez del Laboratorio (T066, R11) ──────────────────────────────────
+
+
+@router.get("/api/juez")
+async def juez(request: Request, quien: Quien = Depends(firma)) -> dict[str, str]:
+    """Lo que el juez del Laboratorio compara (solo `r: sistema`): el mismo
+    texto que Wline armaba con `agent_profile` y `kb_entry`, desde la vigente.
+    Sin vigente, lo que migraría de Wline, sin guardarlo: abrir el panel sigue
+    siendo lo único que migra."""
+    ctx = request.app.state.ctx
+    vig = await _vigente(ctx.store.pool, quien.organizacion)
+    if vig is not None:
+        contenido = _json(vig["contenido"])
+    else:
+        contenido, _ = _desde_wline(await _automation(ctx.crm))
+    identidad = contenido.get("identidad") or {}
+    lineas = [
+        f"Nombre: {identidad.get('nombre') or ctx.settings.agent_name}",
+        f"Tono: {identidad['tono']}" if identidad.get("tono") else None,
+        f"Instrucciones: {contenido['instrucciones']}" if contenido.get("instrucciones") else None,
+        f"Escalado: {contenido['escalado']}" if contenido.get("escalado") else None,
+    ]
+    return {
+        "comportamiento": "\n".join(linea for linea in lineas if linea),
+        "conocimiento": _kb(contenido.get("conocimiento")) or "(knowledge base vacío)",
+    }
 
 
 # ── Plataformas del modelo (FR-040, FR-041, FR-043, FR-045) ──────────────

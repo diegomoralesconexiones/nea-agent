@@ -319,7 +319,60 @@
     });
   }
 
+  // ── Certificación (T067; R8, FR-048) ────────────────────────────────────
+
+  const COSTO =
+    "Certificar corre el Laboratorio completo: 7 conversaciones simuladas evaluadas por el juez. " +
+    "Las personas y el juez gastan la llave de Wline y los turnos del agente se cobran en esta plataforma. " +
+    "Tarda de 5 a 20 minutos; mientras tanto, la conversación de prueba de la bandeja también usa este eslabón.";
+
+  let avanceDeCertificacion = el("p"); // lo reemplaza cada pintada de la cadena
+  let refrescarMarcas = () => {};
+  let sondeo = 0;
+
+  function certificandoEste(plataformaId, modelo, extras) {
+    const c = estado.certificando;
+    return !!c && c.plataformaId === plataformaId && c.modelo === modelo && !!extras && canonico(c.extras) === canonico(extras);
+  }
+
+  // Consulta el avance solo mientras la página está abierta (FR-005): un
+  // setTimeout que muere con ella. Un sondeo nuevo deja sin efecto al anterior.
+  function seguirCertificacion() {
+    const mio = ++sondeo;
+    const paso = async () => {
+      const c = estado.certificando;
+      if (mio !== sondeo || !c) return;
+      try {
+        const r = await api("GET", "/certificaciones/" + encodeURIComponent(c.runId));
+        if (mio !== sondeo) return;
+        if (r.status === "running") {
+          const p = r.progress || {};
+          decir(avanceDeCertificacion, "Certificando " + c.modelo + "… " + (p.done || 0) + " de " + (p.total || "?") + " conversaciones.");
+          setTimeout(paso, 5000);
+          return;
+        }
+        await recargar();
+        refrescarMarcas();
+        // El aviso de una publicación anterior (p. ej. «no está certificado») ya no vale.
+        decir(document.querySelector("#cadena .pie .mensaje") || el("p"), "");
+        if (r.status !== "done") {
+          decir(avanceDeCertificacion, "La corrida del Laboratorio no terminó (tope o error): el eslabón quedó como estaba.", "error");
+        } else if (r.aprobada) {
+          decir(avanceDeCertificacion, c.modelo + " quedó certificado (puntaje " + r.score + "). Ya puedes publicar la cadena.", "ok");
+        } else {
+          decir(avanceDeCertificacion, c.modelo + " no se certificó: la corrida tuvo un rojo o una falla del juez. Revisa el Laboratorio.", "error");
+        }
+      } catch (error) {
+        decir(avanceDeCertificacion, explicar(error) + " Vuelvo a consultar en 15 s.", "error");
+        setTimeout(paso, 15000);
+      }
+    };
+    refrescarMarcas();
+    paso();
+  }
+
   function marcaDeCertificacion(plataformaId, modelo, extras) {
+    if (certificandoEste(plataformaId, modelo, extras)) return ["certificando…", "pendiente"];
     const cert = (estado.certificaciones || []).find((x) => x.plataformaId === plataformaId && x.modelo === modelo);
     if (!cert || !cert.aprobada || !extras || canonico(cert.extras) !== canonico(extras)) {
       return ["sin certificar", "pendiente"];
@@ -341,7 +394,10 @@
       unica.hidden = !(filas.length && new Set(filas.map((f) => f.plataforma.value)).size === 1);
       sinPlataformas.hidden = (estado.plataformas || []).length > 0;
       agregarBoton.disabled = filas.length >= 6 || !(estado.plataformas || []).length;
-      filas.forEach((f) => lista.append(f.nodo));
+      filas.forEach((f) => {
+        f.certificar.disabled = !!estado.certificando; // una certificación a la vez
+        lista.append(f.nodo);
+      });
     }
 
     function agregar(e) {
@@ -364,6 +420,7 @@
         pintarMarca();
         actualizar();
       });
+      fila.pintarMarca = pintarMarca;
       const mover = (paso) => {
         const i = filas.indexOf(fila);
         const j = i + paso;
@@ -371,15 +428,54 @@
         [filas[i], filas[j]] = [filas[j], filas[i]];
         actualizar();
       };
+
+      // «Certificar»: primero el aviso de costo; la corrida, solo al confirmar.
+      const confirmacion = el("div", { class: "aviso", hidden: true });
+      fila.certificar = el("button", { type: "button" }, "Certificar");
+      fila.certificar.addEventListener("click", () => {
+        if (!fila.modelo.value.trim() || !objetoJson(fila.extras.value)) {
+          decir(avanceDeCertificacion, "Escribe el modelo y unos extras en JSON válidos antes de certificar.", "error");
+          return;
+        }
+        confirmacion.hidden = false;
+      });
+      async function lanzar() {
+        confirmacion.hidden = true;
+        const eslabon = {
+          plataforma_id: fila.plataforma.value,
+          modelo: fila.modelo.value.trim(),
+          extras: objetoJson(fila.extras.value),
+        };
+        try {
+          const r = await api("POST", "/certificaciones", eslabon);
+          estado.certificando = { plataformaId: eslabon.plataforma_id, modelo: eslabon.modelo, extras: eslabon.extras, runId: r.runId };
+          decir(avanceDeCertificacion, "Certificando " + eslabon.modelo + "…");
+          seguirCertificacion();
+        } catch (error) {
+          decir(avanceDeCertificacion, explicar(error), "error");
+        }
+      }
+      confirmacion.append(
+        COSTO,
+        el(
+          "div",
+          { class: "acciones" },
+          el("button", { type: "button", class: "primario", onclick: lanzar }, "Sí, certificar"),
+          el("button", { type: "button", onclick: () => (confirmacion.hidden = true) }, "Cancelar")
+        )
+      );
+
       fila.nodo = el(
         "li",
         { class: "eslabon" },
         el("div", { class: "rejilla" }, campo("Plataforma", fila.plataforma), campo("Modelo", fila.modelo)),
         campo("Extras (JSON)", fila.extras, "Los mismos con que se certificó; por ejemplo {\"reasoning_effort\": \"none\"}."),
         marca,
+        confirmacion,
         el(
           "div",
           { class: "acciones" },
+          fila.certificar,
           el("button", { type: "button", onclick: () => mover(-1) }, "Subir"),
           el("button", { type: "button", onclick: () => mover(1) }, "Bajar"),
           el("button", {
@@ -399,6 +495,11 @@
     }
 
     agregarBoton.addEventListener("click", () => agregar({}));
+    avanceDeCertificacion = el("p", { class: "mensaje", role: "status" });
+    refrescarMarcas = () => {
+      filas.forEach((f) => f.pintarMarca());
+      actualizar();
+    };
     (c.cadena || []).forEach(agregar);
     cuerpo.replaceChildren(
       el("p", { class: "tenue" }, "El primero es el principal; si falla, responde el siguiente. Hasta 6 eslabones, cada uno certificado."),
@@ -406,7 +507,8 @@
       unica,
       lista,
       sinPlataformas,
-      agregarBoton
+      agregarBoton,
+      avanceDeCertificacion
     );
     actualizar();
     return () => ({
@@ -663,6 +765,7 @@
       return;
     }
     pintarTodo();
+    if (estado.certificando) seguirCertificacion(); // una que siguió con la página cerrada
   }
 
   iniciar();

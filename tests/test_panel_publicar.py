@@ -22,6 +22,7 @@ import hashlib
 import json
 import time
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Awaitable, Callable
@@ -89,6 +90,24 @@ class CrmFalso:
         self.relectura_falla = False
         self.al_put: Callable[[int], Awaitable[None]] | None = None
         self.espera = 0.0
+        # El Laboratorio (R8): las corridas que pidió el panel.
+        self.corridas: dict[str, dict[str, Any]] = {}
+        self.falla_lab: Exception | None = None
+        self.al_lab: Callable[[], Awaitable[None]] | None = None
+
+    async def lab_run_start(self) -> str:
+        if self.al_lab:
+            await self.al_lab()
+        if self.falla_lab:
+            raise self.falla_lab
+        run_id = f"run_{len(self.corridas) + 1}"
+        self.corridas[run_id] = {"status": "running", "progress": {"done": 0, "total": 7}, "score": None, "cases": []}
+        return run_id
+
+    async def lab_run_get(self, run_id: str) -> dict[str, Any]:
+        if run_id not in self.corridas:
+            raise CrmConflict("not_found", {"error": {"code": "not_found", "message": "Corrida no encontrada"}})
+        return copy.deepcopy(self.corridas[run_id])
 
     async def automation_get(self) -> dict[str, Any]:
         if self.falla_get:
@@ -692,3 +711,264 @@ async def test_probar_conexion_usa_la_llave_guardada(nea: Nea, monkeypatch: pyte
     }
     assert "sk-or-secreta" not in r.text
     assert (await nea.pedir("POST", "/panel/api/plataformas/pl_otra/probar", {"modelo": "m1", "extras": {}})).status_code == 404
+
+
+# ── Bloque 5 · certificación (T064, R8; plan-bloque5 D1–D3) ──────────────
+
+
+async def certificar(nea: Nea, pid: str, modelo: str = "m1", extras: dict[str, Any] | None = None) -> httpx.Response:
+    return await nea.pedir(
+        "POST", "/panel/api/certificaciones", {"plataforma_id": pid, "modelo": modelo, "extras": extras or {}}
+    )
+
+
+def terminar(crm: CrmFalso, run_id: str, veredictos: list[str], *, judge_failed: int = 0, status: str = "done") -> None:
+    casos = [{"persona": f"p{i}", "status": "done", "veredicto": v} for i, v in enumerate(veredictos)]
+    casos += [{"persona": f"j{i}", "status": "judge_failed", "veredicto": None} for i in range(judge_failed)]
+    crm.corridas[run_id] = {
+        "status": status, "progress": {"done": len(casos), "total": len(casos)}, "score": 90, "cases": casos,
+    }
+
+
+async def pruebas(pool: Any) -> int:
+    return await pool.fetchval("SELECT count(*) FROM cadena_prueba WHERE organization_id = $1", ORG)
+
+
+async def test_certificar_deja_la_cadena_de_prueba_antes_de_pedir_la_corrida(nea: Nea) -> None:
+    await estado(nea)
+    pa = await _plataforma(nea, "Plataforma A")
+    vista: dict[str, Any] = {}
+
+    async def al_lab() -> None:
+        vista["fila"] = await nea.pool.fetchrow(
+            "SELECT eslabon, vence_en - now() AS queda FROM cadena_prueba WHERE organization_id = $1", ORG
+        )
+
+    nea.crm.al_lab = al_lab
+    r = await certificar(nea, pa, "m1", {"reasoning_effort": "none"})
+
+    assert r.status_code == 202, r.text
+    run_id = r.json()["runId"]
+    assert json.loads(vista["fila"]["eslabon"]) == {"plataforma_id": pa, "modelo": "m1", "extras": {"reasoning_effort": "none"}}
+    # D2: el tope del Laboratorio (20 min) más un minuto.
+    assert timedelta(minutes=20) < vista["fila"]["queda"] <= timedelta(minutes=21)
+    assert await nea.pool.fetchval("SELECT lab_run_id FROM cadena_prueba WHERE organization_id = $1", ORG) == run_id
+    e = await estado(nea)  # «certificando…»
+    assert e["certificando"] == {"plataformaId": pa, "modelo": "m1", "extras": {"reasoning_effort": "none"}, "runId": run_id}
+
+
+async def test_una_certificacion_a_la_vez(nea: Nea) -> None:
+    await estado(nea)
+    pa = await _plataforma(nea, "Plataforma A")
+    assert (await certificar(nea, pa)).status_code == 202
+    r = await certificar(nea, pa, "m2")
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "laboratorio_ocupado"
+    assert len(nea.crm.corridas) == 1  # no se le pidió otra corrida a Wline
+
+
+@pytest.mark.parametrize(
+    ("falla", "estado_http", "codigo"),
+    [
+        (
+            CrmConflict("run_in_progress", {"error": {"code": "run_in_progress", "message": "Ya hay una corrida en curso"}}),
+            409,
+            "laboratorio_ocupado",
+        ),
+        (CrmUnreachable("lab/runs devolvió 503"), 502, "wline_inalcanzable"),
+    ],
+)
+async def test_si_wline_no_arranca_la_corrida_no_queda_cadena_de_prueba(
+    nea: Nea, falla: Exception, estado_http: int, codigo: str
+) -> None:
+    await estado(nea)
+    pa = await _plataforma(nea, "Plataforma A")
+    nea.crm.falla_lab = falla
+    r = await certificar(nea, pa)
+    assert r.status_code == estado_http
+    assert r.json()["error"]["code"] == codigo
+    assert await pruebas(nea.pool) == 0
+
+
+@pytest.mark.parametrize(
+    "cuerpo",
+    [
+        {"plataforma_id": "pl_no_existe", "modelo": "m1", "extras": {}},
+        {"plataforma_id": "PA", "modelo": "", "extras": {}},
+        {"plataforma_id": "PA", "modelo": "m1", "extras": {"x": "y" * 2048}},
+        {"plataforma_id": "PA", "modelo": "m1", "extras": [1]},
+    ],
+)
+async def test_certificar_valida_el_eslabon(nea: Nea, cuerpo: dict[str, Any]) -> None:
+    await estado(nea)
+    pa = await _plataforma(nea, "Plataforma A")
+    cuerpo = {**cuerpo, "plataforma_id": pa if cuerpo["plataforma_id"] == "PA" else cuerpo["plataforma_id"]}
+    r = await nea.pedir("POST", "/panel/api/certificaciones", cuerpo)
+    assert r.status_code == 422, r.text
+    assert nea.crm.corridas == {}
+
+
+async def test_la_corrida_en_curso_no_cierra_nada(nea: Nea) -> None:
+    await estado(nea)
+    pa = await _plataforma(nea, "Plataforma A")
+    run_id = (await certificar(nea, pa)).json()["runId"]
+    r = await nea.pedir("GET", f"/panel/api/certificaciones/{run_id}")
+    assert r.status_code == 200
+    assert r.json() == {"status": "running", "progress": {"done": 0, "total": 7}, "score": None}
+    assert await pruebas(nea.pool) == 1
+
+
+@pytest.mark.parametrize(
+    ("veredictos", "judge_failed", "aprobada"),
+    [
+        (["verde"] * 6 + ["amarillo"], 0, True),  # el amarillo pasa (A1)
+        (["verde"] * 6 + ["rojo"], 0, False),
+        (["verde"] * 6, 1, False),
+    ],
+)
+async def test_al_terminar_guarda_la_certificacion(
+    nea: Nea, veredictos: list[str], judge_failed: int, aprobada: bool
+) -> None:
+    await estado(nea)
+    pa = await _plataforma(nea, "Plataforma A")
+    await _certificar(nea.pool, pa, "m1", {})  # una anterior, con otros extras y marcada
+    await nea.pool.execute("UPDATE certificacion SET requiere_atencion = true WHERE organization_id = $1", ORG)
+    run_id = (await certificar(nea, pa, "m1", {"reasoning_effort": "none"})).json()["runId"]
+    # D1: la cadena de prueba anota el modelo que respondió en cada turno.
+    await nea.pool.execute("UPDATE cadena_prueba SET modelo_respondio = 'm1-0731' WHERE organization_id = $1", ORG)
+    terminar(nea.crm, run_id, veredictos, judge_failed=judge_failed)
+
+    r = await nea.pedir("GET", f"/panel/api/certificaciones/{run_id}")
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "status": "done", "progress": {"done": 7, "total": 7}, "score": 90, "aprobada": aprobada,
+    }
+    cert = await nea.pool.fetchrow(
+        "SELECT * FROM certificacion WHERE organization_id = $1 AND plataforma_id = $2 AND modelo = 'm1'", ORG, pa
+    )
+    assert cert["aprobada"] is aprobada
+    assert (cert["lab_run_id"], float(cert["puntaje"]), cert["modelo_respondio"]) == (run_id, 90.0, "m1-0731")
+    assert json.loads(cert["extras"]) == {"reasoning_effort": "none"}
+    assert cert["requiere_atencion"] is False
+    assert await pruebas(nea.pool) == 0
+    # Consultar otra vez da lo mismo.
+    assert (await nea.pedir("GET", f"/panel/api/certificaciones/{run_id}")).json() == r.json()
+
+
+async def test_una_corrida_fallida_no_certifica_ni_descertifica(nea: Nea) -> None:
+    await estado(nea)
+    pa = await _plataforma(nea, "Plataforma A")
+    await _certificar(nea.pool, pa, "m1", {})
+    run_id = (await certificar(nea, pa, "m1", {})).json()["runId"]
+    terminar(nea.crm, run_id, [], status="failed")
+
+    r = await nea.pedir("GET", f"/panel/api/certificaciones/{run_id}")
+    assert r.json()["status"] == "failed"
+    assert r.json()["aprobada"] is False
+    cert = await nea.pool.fetchrow("SELECT aprobada, lab_run_id FROM certificacion WHERE organization_id = $1", ORG)
+    assert (cert["aprobada"], cert["lab_run_id"]) == (True, None)  # la anterior, intacta
+    assert await pruebas(nea.pool) == 0
+
+
+async def test_al_abrir_cierra_una_certificacion_terminada(nea: Nea) -> None:
+    await estado(nea)
+    pa = await _plataforma(nea, "Plataforma A")
+    run_id = (await certificar(nea, pa)).json()["runId"]
+    terminar(nea.crm, run_id, ["verde"] * 7)  # la página se cerró antes de enterarse
+
+    e = await estado(nea)
+    assert e["certificando"] is None
+    assert [c["aprobada"] for c in e["certificaciones"] if c["plataformaId"] == pa] == [True]
+    assert await pruebas(nea.pool) == 0
+
+
+async def test_una_corrida_que_no_es_del_panel(nea: Nea) -> None:
+    await estado(nea)
+    assert (await nea.pedir("GET", "/panel/api/certificaciones/run_ajena")).status_code == 404
+
+
+# ── Bloque 5 · publicar exige certificación (T065, FR-048) ────────────────
+
+
+@pytest.mark.parametrize("cambio", ["modelo", "plataforma", "extras"])
+async def test_cambiar_plataforma_modelo_o_extras_descertifica(nea: Nea, cambio: str) -> None:
+    await estado(nea)
+    pa = await _plataforma(nea, "Plataforma A")
+    pb = await _plataforma(nea, "Plataforma B")
+    await _certificar(nea.pool, pa, "m1", {})
+    certificado = {"plataforma_id": pa, "modelo": "m1", "extras": {}}
+    otro = {
+        "modelo": {**certificado, "modelo": "m2"},
+        "plataforma": {**certificado, "plataforma_id": pb},
+        "extras": {**certificado, "extras": {"reasoning_effort": "none"}},
+    }[cambio]
+
+    r = await publicar(nea, 1, {"cadena": [certificado, otro]})
+    assert r.status_code == 409
+    assert (r.json()["error"]["code"], r.json()["error"]["eslabon"]) == ("sin_certificar", otro)
+    assert (await publicar(nea, 1, {"cadena": [certificado]})).status_code == 200
+
+
+async def test_una_recertificacion_reprobada_descertifica(nea: Nea) -> None:
+    await estado(nea)
+    pa = await _plataforma(nea, "Plataforma A")
+    await _certificar(nea.pool, pa, "m1", {})
+    run_id = (await certificar(nea, pa, "m1", {})).json()["runId"]
+    terminar(nea.crm, run_id, ["verde"] * 6 + ["rojo"])
+    await nea.pedir("GET", f"/panel/api/certificaciones/{run_id}")
+
+    r = await publicar(nea, 1, {"cadena": [{"plataforma_id": pa, "modelo": "m1", "extras": {}}]})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "sin_certificar"
+
+
+# ── Bloque 5 · el juez del Laboratorio (T066, R11; D4, D7) ────────────────
+
+COMPORTAMIENTO = (
+    "Nombre: Sofi\nTono: cálido\nInstrucciones: Vende por caja.\nEscalado: Si pide factura, pasa a una persona."
+)
+CONOCIMIENTO = "P: ¿Hacen envíos?\nR: Sí, a todo el país.\n\nP: \nR: \n\nHorario: 9 a 18 h."
+
+
+async def test_el_juez_lee_la_vigente(nea: Nea) -> None:
+    await estado(nea)
+    r = await nea.pedir("GET", "/panel/api/juez", r="sistema")
+    assert r.status_code == 200, r.text
+    assert r.json() == {"comportamiento": COMPORTAMIENTO, "conocimiento": CONOCIMIENTO}
+
+    identidad = {"nombre": "Sofi", "tono": "", "saludo": ""}
+    assert (await publicar(nea, 1, {"instrucciones": "Vende por pieza.", "identidad": identidad})).status_code == 200
+    r = await nea.pedir("GET", "/panel/api/juez", r="sistema")
+    assert r.json()["comportamiento"] == (
+        "Nombre: Sofi\nInstrucciones: Vende por pieza.\nEscalado: Si pide factura, pasa a una persona."
+    )
+
+
+async def test_el_juez_sin_vigente_arma_el_texto_de_wline_sin_migrar(nea: Nea) -> None:
+    r = await nea.pedir("GET", "/panel/api/juez", r="sistema")
+    assert r.json() == {"comportamiento": COMPORTAMIENTO, "conocimiento": CONOCIMIENTO}
+    assert await numeros(nea.pool) == []  # abrir el panel sigue siendo lo único que migra
+
+
+async def test_el_juez_con_el_conocimiento_vacio(nea: Nea) -> None:
+    nea.crm.agent["knowledge"] = []
+    r = await nea.pedir("GET", "/panel/api/juez", r="sistema")
+    assert r.json()["conocimiento"] == "(knowledge base vacío)"  # como renderKb
+
+
+async def test_el_juez_es_solo_para_wline(nea: Nea) -> None:
+    await estado(nea)
+    assert (await nea.pedir("GET", "/panel/api/juez")).status_code == 401  # owner
+    assert (await nea.pedir("GET", "/panel/api/juez", r="admin")).status_code == 401
+    assert (await nea.pedir("GET", "/panel/api/estado", r="sistema")).status_code == 401
+
+
+# ── Bloque 5 · guardar sin haber abierto el panel (D6) ────────────────────
+
+
+async def test_aplicar_conocimiento_sin_abrir_el_panel_migra_primero(nea: Nea) -> None:
+    r = await nea.pedir("POST", "/panel/api/conocimiento", {"pregunta": "¿Garantía?", "respuesta": "Un año."})
+    assert r.status_code == 200, r.text
+    assert r.json()["numero"] == 2
+    assert await numeros(nea.pool) == [1, 2]
+    assert (await fila(nea.pool, 1))["resumen"] == "migración"

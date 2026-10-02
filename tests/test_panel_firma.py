@@ -181,6 +181,7 @@ def test_sistema_solo_vale_en_el_juez() -> None:
     for rol in ("owner", "admin"):
         assert panel.rol_permitido(rol, "GET", "/panel/api/estado")
         assert panel.rol_permitido(rol, "PUT", "/panel/api/configuracion")
+        assert not panel.rol_permitido(rol, "GET", "/panel/api/juez")  # el juez es solo de Wline (T066)
     assert not panel.rol_permitido("member", "GET", "/panel/api/estado")
 
 

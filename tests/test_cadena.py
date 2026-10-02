@@ -232,6 +232,22 @@ async def test_el_agente_anota_exito_y_error_de_cada_plataforma() -> None:
     assert exito == ("org_1", "pl_b")
 
 
+async def test_la_cadena_de_prueba_anota_el_modelo_que_respondio() -> None:
+    """Bloque 5 (D1): la certificación guarda el modelo que respondió (F15)."""
+    pool = PoolFalso()
+    llm = LlmFalso(LlmReply(content="x", model="m-0731"))
+    await LlmCadena([_e("pl_a", "m", llm)], pool=pool, organization_id="org_1", prueba=True).complete([])
+    anotados = [a for sql, a in pool.ejecutados if "cadena_prueba" in sql]
+    assert anotados == [("org_1", "m-0731")]
+    assert "SET modelo_respondio = $2" in next(sql for sql, _ in pool.ejecutados if "cadena_prueba" in sql)
+
+
+async def test_la_cadena_de_los_clientes_no_toca_la_de_prueba() -> None:
+    pool = PoolFalso()
+    await LlmCadena([_e("pl_a", "m", LlmFalso())], pool=pool, organization_id="org_1").complete([])
+    assert not [sql for sql, _ in pool.ejecutados if "cadena_prueba" in sql]
+
+
 async def test_un_fallo_de_la_base_no_tumba_el_turno() -> None:
     class PoolCaido:
         async def execute(self, *_a: Any) -> None:

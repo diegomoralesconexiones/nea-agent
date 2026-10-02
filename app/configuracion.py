@@ -196,7 +196,7 @@ async def _armar_cadena(
                 requiere_atencion=bool(certificados and cert and cert["requiere_atencion"]),
             )
         )
-    return LlmCadena(out, pool=pool, organization_id=organization_id) if out else None
+    return LlmCadena(out, pool=pool, organization_id=organization_id, prueba=not certificados) if out else None
 
 
 async def preparar_contexto(
