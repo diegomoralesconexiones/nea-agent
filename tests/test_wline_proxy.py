@@ -15,11 +15,15 @@ import httpx
 import pytest
 import respx
 
+import app.dispatch as dispatch
 from app import main
+from app.cadena import LlmCadena
 from app.config import Settings
+from app.configuracion import Preparacion
 from app.dispatch import _contexto_una_organizacion
 from app.llm import OpenAiLlm
 from app.multiorg import LlmSinLlave
+from app.profile import BusinessProfile
 from app.state import AppContext, MemoryStore
 from tests.test_multiorg import _StoreDePrueba, _WorkerQuieto
 
@@ -103,6 +107,85 @@ async def test_sin_contexto_todo_sigue_como_siempre() -> None:
 async def test_un_crm_sin_precarga_no_cambia_nada() -> None:
     ctx = _ctx(object())
     assert await _contexto_una_organizacion(ctx, CONV) is ctx
+
+
+# ── 025: la configuración del panel (T042) ───────────────────────────────
+
+PERFIL_VIGENTE = BusinessProfile(cloud=True, agent_name="Sofi", instructions="Vende por caja.")
+CADENA = LlmCadena([])
+PAYLOAD = {"organization": {"id": "org_uno", "slug": "principal"}, "conversation": {"id": CONV}}
+
+
+@pytest.fixture
+def vigente(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """`preparar_contexto` falso: anota con qué se llamó y devuelve `respuesta`."""
+    llamadas: list[dict[str, Any]] = [{"respuesta": Preparacion()}]
+
+    async def preparar(pool: Any, organization_id: str, context: dict[str, Any], settings: Any, *, es_prueba: bool = False) -> Preparacion:
+        llamadas.append({"org": organization_id, "context": context, "es_prueba": es_prueba})
+        return llamadas[0]["respuesta"]
+
+    monkeypatch.setattr(dispatch, "preparar_contexto", preparar)
+    return llamadas
+
+
+async def test_con_eslabones_certificados_piensa_con_la_cadena(vigente: list[dict[str, Any]]) -> None:
+    vigente[0]["respuesta"] = Preparacion(perfil=PERFIL_VIGENTE, cadena=CADENA)
+    # Aunque el contexto todavía sea v1 con `llm`: Nea habla directo (FR-046).
+    ctx = _ctx(CrmConContexto({"contractVersion": 1, "llm": {"path": "/api/brains/llm"}}))
+
+    turno = await _contexto_una_organizacion(ctx, CONV, PAYLOAD)
+
+    assert turno is not None and turno.llm is CADENA
+    assert await turno.profile.get() == PERFIL_VIGENTE
+    assert vigente[1]["org"] == "org_uno" and vigente[1]["es_prueba"] is False
+
+
+async def test_v2_sin_eslabones_certificados_pasa_a_humano(vigente: list[dict[str, Any]]) -> None:
+    vigente[0]["respuesta"] = Preparacion(perfil=PERFIL_VIGENTE, cadena=None)
+    crm = CrmConContexto({"contractVersion": 2})
+
+    assert await _contexto_una_organizacion(_ctx(crm), CONV, PAYLOAD) is None
+    assert crm.handoffs == [(CONV, "sin_credencial")]
+
+
+async def test_v2_sin_version_vigente_pasa_a_humano(vigente: list[dict[str, Any]]) -> None:
+    crm = CrmConContexto({"contractVersion": 2})
+    assert await _contexto_una_organizacion(_ctx(crm), CONV, PAYLOAD) is None
+    assert crm.handoffs == [(CONV, "sin_credencial")]
+
+
+async def test_transicion_v1_sin_cadena_piensa_por_el_crm_con_el_perfil_vigente(
+    vigente: list[dict[str, Any]],
+) -> None:
+    vigente[0]["respuesta"] = Preparacion(perfil=PERFIL_VIGENTE, cadena=None)
+    ctx = _ctx(CrmConContexto({"contractVersion": 1, "llm": {"path": "/api/brains/llm", "model": "a/b"}}))
+
+    turno = await _contexto_una_organizacion(ctx, CONV, PAYLOAD)
+
+    assert turno is not None and isinstance(turno.llm, OpenAiLlm)
+    assert str(turno.llm._client.base_url).startswith(f"{CRM_URL}/api/brains/llm")
+    assert await turno.profile.get() == PERFIL_VIGENTE
+
+
+async def test_el_turno_de_prueba_pide_la_cadena_de_prueba(vigente: list[dict[str, Any]]) -> None:
+    vigente[0]["respuesta"] = Preparacion(perfil=PERFIL_VIGENTE, cadena=CADENA)
+    payload = {**PAYLOAD, "conversation": {"id": CONV, "isTest": True}}
+
+    await _contexto_una_organizacion(_ctx(CrmConContexto({"contractVersion": 2})), CONV, payload)
+
+    assert vigente[1]["es_prueba"] is True
+
+
+async def test_sin_organizacion_en_el_despacho_usa_la_de_la_instancia(vigente: list[dict[str, Any]]) -> None:
+    await _contexto_una_organizacion(_ctx(CrmConContexto({"contractVersion": 1})), CONV, {})
+    assert vigente[1]["org"] == "principal"
+
+
+async def test_la_atencion_se_mezcla_en_el_contexto_que_usa_el_turno(vigente: list[dict[str, Any]]) -> None:
+    contexto = {"contractVersion": 1}
+    await _contexto_una_organizacion(_ctx(CrmConContexto(contexto)), CONV, PAYLOAD)
+    assert vigente[1]["context"] is contexto  # el mismo objeto que consume get_context
 
 
 @pytest.fixture

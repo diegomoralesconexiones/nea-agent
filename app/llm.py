@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from openai import AsyncOpenAI
+from openai import APIConnectionError, APIStatusError, AsyncOpenAI
 
 logger = logging.getLogger("nea.llm")
 
@@ -41,7 +41,34 @@ def medir_turno() -> list[float]:
 
 
 class LlmExhausted(Exception):
-    """El LLM falló todos los reintentos — el turno debe degradar en silencio."""
+    """El LLM falló todos los reintentos — el turno debe degradar en silencio.
+
+    Wline (025): `tipo` dice qué hacer con el eslabón en la cadena de respaldo
+    (app/cadena.py): `plataforma`, `modelo`, `pasajero` o `vacia` (y
+    `presupuesto`, que solo pone la cadena cuando se acaba el turno).
+    """
+
+    def __init__(self, mensaje: str = "", tipo: str = "pasajero") -> None:
+        super().__init__(mensaje)
+        self.tipo = tipo
+
+
+def tipo_de_error(exc: Exception) -> str:
+    """Wline (025, R6): la clase de fallo, para que la cadena no lea el SDK.
+
+    Red y tiempo agotado cuentan como la plataforma entera: si no contesta a un
+    modelo, tampoco a los demás que tenga en la cadena.
+    """
+    if isinstance(exc, APIConnectionError):  # incluye APITimeoutError
+        return "plataforma"
+    estado = exc.status_code if isinstance(exc, APIStatusError) else None
+    if estado in (401, 402, 403):
+        return "plataforma"
+    if estado is not None and (estado in (408, 429) or estado >= 500):
+        return "pasajero"
+    if estado is not None and 400 <= estado < 500:
+        return "modelo"
+    return "pasajero"
 
 
 @dataclass
@@ -55,6 +82,8 @@ class ToolCall:
 class LlmReply:
     content: str | None
     tool_calls: list[ToolCall] = field(default_factory=list)
+    # Wline (025): el modelo que dice la plataforma que respondió (F15).
+    model: str | None = None
 
 
 class Llm(Protocol):
@@ -109,6 +138,8 @@ class OpenAiLlm:
         reasoning_effort: str = "",
         provider_sort: str = "",
         timeout: float = DEFAULT_TIMEOUT,
+        reintentos: int = RETRIES,
+        extra_body: dict[str, Any] | None = None,
     ) -> None:
         # base_url ≠ None → proveedor OpenAI-compatible (p. ej. OpenRouter,
         # para el bench de modelos del 002). Ojo: la transcripción de audio
@@ -139,6 +170,11 @@ class OpenAiLlm:
         self._reasoning_effort = reasoning_effort.strip()
         self._provider_sort = provider_sort.strip()
         self._extras_ok = True
+        # Wline (025): un eslabón de la cadena no reintenta por su cuenta (la
+        # cadena decide según el tipo de fallo) y lleva sus extras certificados,
+        # que no se apagan solos como los de velocidad.
+        self._reintentos = reintentos
+        self._extra_body = dict(extra_body or {})
         # Con proveedor propio (OpenRouter y compañía) no hay endpoint de
         # transcripción: el audio se manda DENTRO del chat, a un modelo que
         # sepa oír. Se decide aquí y no en cada llamada para que el camino sea
@@ -308,13 +344,14 @@ class OpenAiLlm:
         tools: list[dict[str, Any]] | None = None,
     ) -> LlmReply:
         last_error: Exception | None = None
-        for attempt in range(self.RETRIES + 1):
+        tipo = "pasajero"
+        for attempt in range(self._reintentos + 1):
             try:
                 kwargs: dict[str, Any] = {}
                 if tools:
                     kwargs["tools"] = tools
                     kwargs["tool_choice"] = "auto"
-                extra = self._extras()
+                extra = {**self._extras(), **self._extra_body}
                 if extra:
                     kwargs["extra_body"] = extra
                 resp = await self._client.chat.completions.create(
@@ -331,24 +368,28 @@ class OpenAiLlm:
                 if reply.content or reply.tool_calls:
                     return reply
                 last_error = ValueError("respuesta vacía del LLM (sin content ni tools)")
+                tipo = "vacia"
                 logger.warning("llm: respuesta vacía, intento %d", attempt + 1)
             except Exception as exc:  # red, API, parseo — todo reintenta
                 last_error = exc
+                tipo = tipo_de_error(exc)
                 self._quiza_por_los_extras(exc)
                 logger.warning("llm: fallo en intento %d: %s", attempt + 1, exc)
-            if attempt < self.RETRIES:
+            if attempt < self._reintentos:
                 await asyncio.sleep(2**attempt)  # 1 s, 2 s
-        raise LlmExhausted(str(last_error))
+        raise LlmExhausted(str(last_error), tipo=tipo)
 
     @staticmethod
     def _parse(resp: Any) -> LlmReply:
         """Extracción tolerante: nunca truena por formato inesperado."""
+        model = getattr(resp, "model", None)
+        model = model if isinstance(model, str) and model else None
         choices = getattr(resp, "choices", None) or []
         if not choices:
-            return LlmReply(content=None)
+            return LlmReply(content=None, model=model)
         message = getattr(choices[0], "message", None)
         if message is None:
-            return LlmReply(content=None)
+            return LlmReply(content=None, model=model)
         content = getattr(message, "content", None)
         if isinstance(content, str):
             content = content.strip() or None
@@ -371,4 +412,4 @@ class OpenAiLlm:
             tool_calls.append(
                 ToolCall(id=getattr(tc, "id", "") or "", name=name, arguments=args)
             )
-        return LlmReply(content=content, tool_calls=tool_calls)
+        return LlmReply(content=content, tool_calls=tool_calls, model=model)

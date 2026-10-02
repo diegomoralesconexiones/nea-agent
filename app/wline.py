@@ -14,7 +14,8 @@ v1). Un CRM que no las manda recibe exactamente el comportamiento de siempre.
   solo con `capabilities.mover_pipeline` y al menos un criterio escrito.
 - N4: `route_out` exige `motivo` → `POST /api/brains/pipeline/redirect`,
   solo con `capabilities.redirigir`.
-- N5: el prompt explica líneas, criterios, umbral y dónde está el lead.
+- N5: el prompt explica líneas, criterios, umbral y dónde está el lead, y
+  (025) cómo atender a cada tipo, que llega mezclado desde el panel.
 """
 from __future__ import annotations
 
@@ -247,6 +248,10 @@ def seccion_prompt(context: dict[str, Any] | None) -> list[str]:
             f"{l.get('tipoCliente')}): "
             + (json.dumps(criterio, ensure_ascii=False) if criterio else "sin criterio escrito")
         )
+        # 025 (US2): cómo atender a ese tipo, desde el panel de Nea.
+        atencion = str(l.get("atencion") or "").strip()
+        if atencion:
+            out.append(f"    Cómo atenderlo: {json.dumps(atencion, ensure_ascii=False)}")
     ubicacion = lead.get("stageName") or "sin lead"
     if lead.get("line"):
         ubicacion += f" (línea {lead['line']})"

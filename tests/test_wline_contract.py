@@ -78,21 +78,23 @@ async def _despachar(
     return resp
 
 
-@pytest.mark.parametrize("version", [2, 0, "1", "dos"])
+@pytest.mark.parametrize("version", [3, 0, "1", "dos"])
 async def test_una_version_desconocida_es_409_y_no_se_procesa(
     nea: httpx.AsyncClient, ctx: AppContext, procesados: list[dict[str, Any]], version: Any
 ) -> None:
     resp = await _despachar(nea, ctx, {"contractVersion": version})
 
     assert resp.status_code == 409
-    assert resp.json() == {"error": {"code": "contrato_incompatible", "supported": [1]}}
+    assert resp.json() == {"error": {"code": "contrato_incompatible", "supported": [1, 2]}}
     assert procesados == []
 
 
-async def test_la_version_1_se_procesa(
-    nea: httpx.AsyncClient, ctx: AppContext, procesados: list[dict[str, Any]]
+@pytest.mark.parametrize("version", [1, 2])
+async def test_las_versiones_1_y_2_se_procesan(
+    nea: httpx.AsyncClient, ctx: AppContext, procesados: list[dict[str, Any]], version: int
 ) -> None:
-    resp = await _despachar(nea, ctx, {"contractVersion": 1})
+    # 025: la v2 trae el contexto sin `agent`/`knowledge`/`llm` (viven en Nea).
+    resp = await _despachar(nea, ctx, {"contractVersion": version})
     assert resp.status_code == 200
     assert [p["dispatchId"] for p in procesados] == ["dsp_1"]
 

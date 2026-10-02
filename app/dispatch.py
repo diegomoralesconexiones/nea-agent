@@ -29,6 +29,8 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from app.cadena import iniciar_turno
+from app.configuracion import PerfilFijo, preparar_contexto
 from app.http_limits import limited_body
 from app.llm import medir_turno
 from app.multiorg import llm_hacia_crm, organizacion_del_despacho
@@ -41,8 +43,9 @@ router = APIRouter()
 
 
 # Wline (N9): versiones del contrato CRM ⇄ cerebro que esta Nea entiende. Un
-# despacho sin `contractVersion` (el CRM de origen) se procesa igual.
-CONTRATOS_SOPORTADOS = (1,)
+# despacho sin `contractVersion` (el CRM de origen) se procesa igual. La 2
+# (025) trae el contexto sin `agent`/`knowledge`/`llm`: viven en el panel.
+CONTRATOS_SOPORTADOS = (1, 2)
 
 
 def firma_valida(body: bytes, header: str | None, secret: str) -> bool:
@@ -169,6 +172,9 @@ async def _procesar(ctx: AppContext, payload: dict[str, Any], *, durable: bool =
     """
     dispatch_id = str(payload.get("dispatchId") or "")
     latencias = medir_turno()
+    # Wline (025): 90 s desde aquí para todo el turno, y la traza de la cadena
+    # que viaja en el cierre (R6, R16).
+    traza = iniciar_turno()
     estado: dict[str, Any] = {"procesado": False, "crm": ctx.crm}
     error: str | None = None
     try:
@@ -181,7 +187,9 @@ async def _procesar(ctx: AppContext, payload: dict[str, Any], *, durable: bool =
     finally:
         cerrar = getattr(estado["crm"], "cerrar_despacho", None)
         if estado["procesado"] and dispatch_id and callable(cerrar):
-            await cerrar(dispatch_id, round(sum(latencias)) if latencias else None, error)
+            await cerrar(
+                dispatch_id, round(sum(latencias)) if latencias else None, error, traza or None
+            )
 
 
 async def _turno_del_despacho(
@@ -218,7 +226,7 @@ async def _turno_del_despacho(
         registrar = getattr(ctx.crm, "registrar", None)
         if callable(registrar):
             registrar(identity, conversation_id)
-        ctx_turno = await _contexto_una_organizacion(ctx, conversation_id)
+        ctx_turno = await _contexto_una_organizacion(ctx, conversation_id, payload)
         if ctx_turno is None:
             return  # sin con qué pensar: la conversación ya quedó con un humano
 
@@ -248,25 +256,47 @@ async def _turno_del_despacho(
 
 
 async def _contexto_una_organizacion(
-    ctx: AppContext, conversation_id: str
+    ctx: AppContext, conversation_id: str, payload: dict[str, Any] | None = None
 ) -> AppContext | None:
-    """Una sola organización que piensa por el CRM (Wline, N1).
+    """Una sola organización: Wline (N1; 025).
 
-    Si el contexto trae `llm`, el turno piensa por `{CRM}{llm.path}` con el
-    secreto del cerebro: la llave del proveedor se queda en el CRM. `llm:
-    null` = el CRM no tiene con qué pensar → nadie contesta con una llave
-    propia y la conversación pasa a un humano. Sin `llm` en el contexto (un
-    CRM que no lo ofrece), el comportamiento de siempre: `LLM_API_KEY`.
+    Primero la versión vigente del panel (una llamada a `preparar_contexto`):
+    su perfil, la atención por tipo y, si tiene eslabones certificados, la
+    cadena con la que Nea habla directo con las plataformas (FR-046).
+
+    Transición (R10), mientras la vigente no tenga eslabones certificados: si
+    el contexto trae `llm` (v1), el turno piensa por `{CRM}{llm.path}` con el
+    secreto del cerebro. `llm: null`, o un contexto v2 (que ya no lo trae) =
+    no hay con qué pensar → la conversación pasa a un humano con
+    `sin_credencial`. Sin `llm` en un contexto v1 (un CRM que no lo ofrece),
+    el comportamiento de siempre: `LLM_API_KEY`.
     """
     precargar = getattr(ctx.crm, "precargar", None)
     if not callable(precargar):
         return ctx
     contexto = await precargar(conversation_id)
-    if contexto is None or "llm" not in contexto:
+    if contexto is None:
+        return ctx
+    payload = payload or {}
+    org = organizacion_del_despacho(payload)
+    prep = await preparar_contexto(
+        getattr(ctx.store, "pool", None),
+        org[0] if org else ctx.settings.crm_organization,
+        contexto,
+        ctx.settings,
+        es_prueba=(payload.get("conversation") or {}).get("isTest") is True,
+    )
+    if prep.perfil is not None:
+        ctx = replace(ctx, profile=PerfilFijo(prep.perfil))
+    if prep.cadena is not None:
+        return replace(ctx, llm=prep.cadena)
+    if "llm" not in contexto and contexto.get("contractVersion") != 2:
         return ctx
     config_ia = contexto.get("llm")
     if not config_ia:
-        logger.warning("el CRM no ofrece IA para %s — sin turno", conversation_id)
+        logger.warning(
+            "sin eslabones certificados ni IA del CRM para %s — sin turno", conversation_id
+        )
         await _a_humano(ctx.crm, conversation_id, "sin_credencial")
         return None
     settings = ctx.settings

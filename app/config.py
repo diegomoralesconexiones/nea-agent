@@ -230,6 +230,13 @@ class Settings(BaseSettings):
     # contenedor por negocio.
     crm_organization: str = ""
 
+    # Wline (025): cifra las llaves de las plataformas del modelo que se
+    # registran en el panel (AES-256-GCM; 32 bytes en base64, con copia FUERA
+    # del servidor: sin ella las llaves guardadas no se pueden leer). Es propia
+    # de Nea a propósito, no la ENCRYPTION_KEY de Wline. Opcional: sin ella el
+    # panel no registra plataformas y lo dice (app/configuracion.py).
+    nea_encryption_key: str = ""
+
     # Infra
     database_url: str = ""
     port: int = 8000

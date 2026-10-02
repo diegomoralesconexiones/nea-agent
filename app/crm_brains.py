@@ -409,23 +409,29 @@ class BrainsCrmClient(CrmClient):
         return _aplanar_reserva(resp.json())
 
     async def cerrar_despacho(
-        self, dispatch_id: str, provider_ms: int | None, error: str | None
+        self,
+        dispatch_id: str,
+        provider_ms: int | None,
+        error: str | None,
+        cadena: dict[str, Any] | None = None,
     ) -> None:
         """Avisa al CRM que el turno de ese despacho terminó (Wline, N7).
 
         Siempre, también si falló: el CRM tiene la conversación esperando el
         cierre y, sin él, espera hasta su tope antes de seguir. El desenlace
         lo deriva el CRM de lo que observó; aquí solo va la latencia del
-        modelo y el error, si lo hubo. Un fallo al avisar se registra y ya:
-        el turno terminó igual.
+        modelo, el error, si lo hubo, y (025, R16) qué plataforma y modelo
+        respondieron y qué eslabones se saltaron. Un fallo al avisar se
+        registra y ya: el turno terminó igual.
         """
         if not dispatch_id:
             return
+        cuerpo: dict[str, Any] = {"providerMs": provider_ms, "error": (error or None) and error[:500]}
+        if cadena:
+            cuerpo["cadena"] = _cadena_para_wline(cadena)
         try:
             resp = await self._request(
-                "POST",
-                f"/api/brains/dispatch/{dispatch_id}/close",
-                json={"providerMs": provider_ms, "error": (error or None) and error[:500]},
+                "POST", f"/api/brains/dispatch/{dispatch_id}/close", json=cuerpo
             )
             if not resp.is_success:
                 logger.warning("cierre del despacho %s: el CRM respondió %s", dispatch_id, resp.status_code)
@@ -461,6 +467,29 @@ class BrainsCrmClient(CrmClient):
         data: dict[str, Any] = resp.json()
         return data
 
+    # ── 025: lo que el panel le pide a Wline (contracts/panel.md §5) ─────
+    #
+    # Solo desde el panel y en los momentos del spec (FR-006): al abrirlo, al
+    # publicar y al certificar. Un rechazo (4xx) es `CrmConflict` con el código
+    # y el cuerpo, que traen el motivo en español para mostrarlo tal cual
+    # (FR-017); una caída o la red, `CrmUnreachable`.
+
+    async def automation_get(self) -> dict[str, Any]:
+        return _respuesta(await self._request("GET", "/api/brains/automation"), "automation")
+
+    async def automation_put(self, version: int, rules: dict[str, Any]) -> dict[str, Any]:
+        resp = await self._request(
+            "PUT", "/api/brains/automation", json={"version": version, "rules": rules}
+        )
+        return _respuesta(resp, "automation")
+
+    async def lab_run_start(self) -> str:
+        resp = await self._request("POST", "/api/brains/lab/runs")
+        return str(_respuesta(resp, "lab/runs")["runId"])
+
+    async def lab_run_get(self, run_id: str) -> dict[str, Any]:
+        return _respuesta(await self._request("GET", f"/api/brains/lab/runs/{run_id}"), "lab/runs")
+
     async def post_reset(self, conversation_id: str) -> None:
         """El reinicio de pruebas no existe en esta superficie.
 
@@ -471,12 +500,17 @@ class BrainsCrmClient(CrmClient):
         logger.info("reset no disponible en modo cloud — ignorado")
 
 
-def _perfil_desde_contexto(data: dict[str, Any]) -> dict[str, Any]:
+def _perfil_desde_contexto(data: dict[str, Any]) -> dict[str, Any] | None:
     """Traduce `agent` + `knowledge` a lo que espera `profile_from_payload`.
 
     El conocimiento llega como pares pregunta/respuesta y se aplana a texto:
     es lo que ya sabe consumir el prompt, y hacerlo aquí evita tocarlo.
+
+    Wline (025): solo v1. El contexto v2 ya no trae perfil (vive en el panel
+    de Nea, `app/configuracion.py`): None, y el turno usa el de la vigente.
     """
+    if data.get("contractVersion") not in (None, 1):
+        return None
     agent = data.get("agent") or {}
     knowledge = data.get("knowledge") or []
     bloques = []
@@ -494,6 +528,34 @@ def _perfil_desde_contexto(data: dict[str, Any]) -> dict[str, Any]:
         # que el agente puede compartir). Lista vacía en vez de omitirla: el
         # consumidor ya la trata como opcional.
         "resources": [],
+    }
+
+
+def _respuesta(resp: httpx.Response, que: str) -> dict[str, Any]:
+    if resp.is_success:
+        return _payload(resp)
+    if es_caida(resp.status_code):
+        raise CrmUnreachable(f"{que} devolvió {resp.status_code}")
+    raise CrmConflict(_conflict_code(resp), _payload(resp))
+
+
+def _cadena_para_wline(cadena: dict[str, Any]) -> dict[str, Any]:
+    """La traza en la forma que Wline valida: tres nombres ≤ 120, ≤ 10 saltos.
+
+    Si nadie respondió, los nombres van vacíos: los saltos igual cuentan qué
+    se intentó, y sin los nombres Wline rechazaría el cierre entero.
+    """
+    def nombre(valor: Any) -> str:
+        return str(valor or "")[:120]
+
+    return {
+        "plataforma": nombre(cadena.get("plataforma")),
+        "modelo": nombre(cadena.get("modelo")),
+        "modeloRespondio": nombre(cadena.get("modeloRespondio")),
+        "saltos": [
+            {"plataforma": nombre(s.get("plataforma")), "modelo": nombre(s.get("modelo")), "tipo": s.get("tipo")}
+            for s in list(cadena.get("saltos") or [])[:10]
+        ],
     }
 
 

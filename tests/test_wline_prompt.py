@@ -44,6 +44,23 @@ def test_con_candado_humano_no_propone_mover() -> None:
     assert "una persona del equipo ubicó a este lead: NO propongas moverlo" in seccion[-1]
 
 
+def test_como_atenderlo_va_con_su_linea() -> None:
+    """025 (US2): la «atención» de cada tipo viene del panel (mezclada en el
+    contexto por `configuracion.mezclar_atencion`); va aunque no haya criterio."""
+    ctx = contexto()
+    lineas = ctx["pipeline"]["lines"]
+    lineas[0]["atencion"] = "Recomiéndale el paquete chico."
+    lineas[1]["atencion"] = "Ofrece la lista de precios por caja."
+    seccion = seccion_prompt(ctx)
+
+    i = seccion.index("  - Consumidores (linea=consumidores, tipo_cliente=Consumidor): sin criterio escrito")
+    assert seccion[i + 1] == '    Cómo atenderlo: "Recomiéndale el paquete chico."'
+    j = seccion.index('  - Mayoristas (linea=mayoristas, tipo_cliente=Mayorista): "Compra por caja para reventa"')
+    assert seccion[j + 1] == '    Cómo atenderlo: "Ofrece la lista de precios por caja."'
+    # La regla de clasificación no cambia: sigue contando solo los criterios.
+    assert seccion[-1] == CON_CRITERIOS[-1]
+
+
 def test_sin_wline_no_agrega_nada() -> None:
     assert seccion_prompt({"contact": {}, "lead": {"stageName": "Nuevo"}}) == []
     assert seccion_prompt(None) == []

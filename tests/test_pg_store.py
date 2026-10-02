@@ -88,6 +88,11 @@ TABLAS = (
     "bot_conversation",
     "processed_message",
     "relay_queue",
+    "agente_vigente",
+    "agente_version",
+    "certificacion",
+    "plataforma_modelo",
+    "cadena_prueba",
 )
 
 
@@ -227,6 +232,53 @@ async def test_re_migrar_con_datos_no_pierde_nada(store):
     assert otra_vez.id == conv.id
     assert [m.content for m in await store.recent_messages(conv.id, 10)] == ["hola"]
     assert len(await store.due_relays(await _ahora(store))) == 1
+
+
+# Wline (025, T035): las tablas del panel. Cada una es de UNA organización, y
+# la organización va primero en la llave: así ninguna consulta puede leer la
+# configuración de otra sin nombrarla.
+TABLAS_DEL_PANEL = (
+    "agente_version",
+    "agente_vigente",
+    "plataforma_modelo",
+    "certificacion",
+    "cadena_prueba",
+)
+
+
+@pytest.mark.parametrize("tabla", TABLAS_DEL_PANEL)
+async def test_las_tablas_del_panel_llevan_la_organizacion_primero(store, tabla):
+    llave = await store.pool.fetch(
+        """
+        SELECT a.attname FROM pg_index i
+        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+        WHERE i.indrelid = $1::regclass AND i.indisprimary
+        ORDER BY array_position(i.indkey, a.attnum)
+        """,
+        tabla,
+    )
+    assert llave and llave[0]["attname"] == "organization_id"
+    columna = await store.pool.fetchrow(
+        """
+        SELECT data_type, is_nullable FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = $1
+          AND column_name = 'organization_id'
+        """,
+        tabla,
+    )
+    assert (columna["data_type"], columna["is_nullable"]) == ("text", "NO")
+
+
+async def test_re_migrar_no_toca_la_configuracion_del_panel(store):
+    await store.pool.execute(
+        """INSERT INTO agente_version (organization_id, numero, contenido, resumen, autor_id, autor_correo)
+           VALUES ('org_a', 1, '{"cadena": []}', 'migración', 'migración', 'migración')"""
+    )
+    await store.pool.execute("INSERT INTO agente_vigente (organization_id, numero) VALUES ('org_a', 1)")
+
+    await store.migrate(MIGRATIONS_DIR)
+
+    assert await store.pool.fetchval("SELECT numero FROM agente_vigente WHERE organization_id = 'org_a'") == 1
 
 
 # ─────────────────────────────────────────────────────────────── dedup ───

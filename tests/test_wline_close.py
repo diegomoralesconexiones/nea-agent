@@ -16,7 +16,9 @@ import pytest
 import respx
 
 import app.dispatch as dispatch
+from app.cadena import Eslabon, LlmCadena, Plataforma, restante
 from app.config import Settings
+from app.crm import CrmConflict, CrmUnreachable
 from app.crm_brains import BrainsCrmClient
 from app.dispatch_worker import drain_one
 from app.llm import LlmReply, OpenAiLlm, medir_turno
@@ -74,6 +76,36 @@ async def test_una_caida_de_red_no_se_propaga(cliente: BrainsCrmClient) -> None:
 
 
 @respx.mock
+async def test_cierra_con_la_cadena(cliente: BrainsCrmClient) -> None:
+    """025 (R16): qué plataforma y modelo respondieron, y los saltos."""
+    ruta = respx.post(f"{CRM_URL}/api/brains/dispatch/dsp_1/close").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    cadena = {
+        "plataforma": "OpenAI", "modelo": "gpt-6-luna", "modeloRespondio": "gpt-6-luna",
+        "saltos": [{"plataforma": "OpenRouter", "modelo": "deepseek/x", "tipo": "plataforma"}],
+    }
+    await cliente.cerrar_despacho("dsp_1", 900, None, cadena)
+    assert json.loads(ruta.calls.last.request.content) == {"providerMs": 900, "error": None, "cadena": cadena}
+
+
+@respx.mock
+async def test_la_cadena_se_ajusta_al_contrato(cliente: BrainsCrmClient) -> None:
+    """Wline exige los tres nombres (≤ 120) y ≤ 10 saltos; si nadie respondió,
+    los nombres van vacíos y los saltos igual cuentan qué pasó."""
+    ruta = respx.post(f"{CRM_URL}/api/brains/dispatch/dsp_1/close").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    saltos = [{"plataforma": "P" * 200, "modelo": "m", "tipo": "modelo"}] * 12
+    await cliente.cerrar_despacho("dsp_1", None, "LlmExhausted", {"saltos": saltos})
+
+    enviada = json.loads(ruta.calls.last.request.content)["cadena"]
+    assert (enviada["plataforma"], enviada["modelo"], enviada["modeloRespondio"]) == ("", "", "")
+    assert len(enviada["saltos"]) == 10
+    assert enviada["saltos"][0] == {"plataforma": "P" * 120, "modelo": "m", "tipo": "modelo"}
+
+
+@respx.mock
 async def test_sin_despacho_no_hay_nada_que_cerrar(cliente: BrainsCrmClient) -> None:
     ruta = respx.post(url__startswith=f"{CRM_URL}/api/brains/dispatch/").mock(
         return_value=httpx.Response(200)
@@ -123,6 +155,7 @@ class CrmQueAnota:
     def __init__(self, revienta: bool = False) -> None:
         self.revienta = revienta
         self.cierres: list[tuple[str, int | None, str | None]] = []
+        self.cadenas: list[dict[str, Any] | None] = []
 
     def registrar(self, identity: str, conversation_id: str) -> None:
         pass
@@ -133,9 +166,11 @@ class CrmQueAnota:
         return None
 
     async def cerrar_despacho(
-        self, dispatch_id: str, provider_ms: int | None, error: str | None
+        self, dispatch_id: str, provider_ms: int | None, error: str | None,
+        cadena: dict[str, Any] | None = None,
     ) -> None:
         self.cierres.append((dispatch_id, provider_ms, error))
+        self.cadenas.append(cadena)
 
 
 def _ctx(crm: Any) -> AppContext:
@@ -181,6 +216,35 @@ async def test_el_turno_cierra_con_la_latencia_acumulada(turno_con_modelo: None)
     assert error is None
 
 
+async def test_el_turno_tiene_90_s_desde_el_despacho(monkeypatch: pytest.MonkeyPatch) -> None:
+    plazos: list[float | None] = []
+
+    async def handle_flush(ctx: AppContext, identity: str, items: list[Any], **_: Any) -> None:
+        plazos.append(restante())
+
+    monkeypatch.setattr(dispatch, "handle_flush", handle_flush)
+    await dispatch._procesar(_ctx(CrmQueAnota()), _payload())
+    assert plazos[0] is not None and 89 < plazos[0] <= 90
+
+
+async def test_el_cierre_lleva_la_traza_de_la_cadena(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Respondo:
+        async def complete(self, messages: Any, tools: Any = None) -> LlmReply:
+            return LlmReply(content="hola", model="m-0731")
+
+    cadena = LlmCadena([Eslabon(Plataforma("pl_a", "OpenRouter", "http://x", "sk-x"), "m", Respondo())])
+
+    async def handle_flush(ctx: AppContext, identity: str, items: list[Any], **_: Any) -> None:
+        await cadena.complete([])
+
+    monkeypatch.setattr(dispatch, "handle_flush", handle_flush)
+    crm = CrmQueAnota()
+    await dispatch._procesar(_ctx(crm), _payload())
+    assert crm.cadenas == [
+        {"plataforma": "OpenRouter", "modelo": "m", "modeloRespondio": "m-0731", "saltos": []}
+    ]
+
+
 async def test_un_turno_sin_modelo_cierra_sin_latencia(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -191,6 +255,7 @@ async def test_un_turno_sin_modelo_cierra_sin_latencia(
     crm = CrmQueAnota()
     await dispatch._procesar(_ctx(crm), _payload())
     assert crm.cierres == [("dsp_1", None, None)]
+    assert crm.cadenas == [None]  # sin cadena (v1 por el CRM), el cierre de siempre
 
 
 async def test_un_turno_que_revienta_cierra_igual_con_el_error() -> None:
@@ -256,3 +321,99 @@ async def test_turnos_concurrentes_no_se_mezclan_la_latencia(
     )
     assert rapido.cierres[0][1] is not None and rapido.cierres[0][1] < 60
     assert lento.cierres[0][1] is not None and lento.cierres[0][1] >= 70
+
+
+# ── 025: lo que el panel le pide a Wline (contracts/panel.md §5) ─────────
+
+
+@respx.mock
+async def test_automation_get_con_el_secreto(cliente: BrainsCrmClient) -> None:
+    ruta = respx.get(f"{CRM_URL}/api/brains/automation").mock(
+        return_value=httpx.Response(200, json={"appliedVersion": 12, "lines": []})
+    )
+    assert await cliente.automation_get() == {"appliedVersion": 12, "lines": []}
+    pedido = ruta.calls.last.request
+    assert pedido.headers["authorization"] == f"Bearer {SECRETO}"
+    assert pedido.headers["x-vocero-organization"] == "principal"
+
+
+@respx.mock
+async def test_automation_put_manda_version_y_reglas(cliente: BrainsCrmClient) -> None:
+    ruta = respx.put(f"{CRM_URL}/api/brains/automation").mock(
+        return_value=httpx.Response(200, json={"appliedVersion": 13})
+    )
+    reglas = {"fichaFields": [], "threshold": "Clasificado", "capabilities": {}, "lineCriteria": {}}
+    assert await cliente.automation_put(13, reglas) == {"appliedVersion": 13}
+    assert json.loads(ruta.calls.last.request.content) == {"version": 13, "rules": reglas}
+
+
+@pytest.mark.parametrize(
+    "estado, codigo",
+    [(409, "version_vieja"), (422, "umbral_invalido")],
+)
+@respx.mock
+async def test_automation_put_rechazado_trae_codigo_y_mensaje(
+    cliente: BrainsCrmClient, estado: int, codigo: str
+) -> None:
+    cuerpo = {"error": {"code": codigo, "message": "El umbral no existe en todas las líneas"}}
+    respx.put(f"{CRM_URL}/api/brains/automation").mock(return_value=httpx.Response(estado, json=cuerpo))
+    with pytest.raises(CrmConflict) as exc:
+        await cliente.automation_put(13, {})
+    assert exc.value.code == codigo
+    assert exc.value.payload == cuerpo  # el panel muestra el mensaje tal cual (FR-017)
+
+
+@respx.mock
+async def test_automation_caido_o_sin_red_es_crm_unreachable(cliente: BrainsCrmClient) -> None:
+    respx.get(f"{CRM_URL}/api/brains/automation").mock(return_value=httpx.Response(503))
+    with pytest.raises(CrmUnreachable):
+        await cliente.automation_get()
+    respx.put(f"{CRM_URL}/api/brains/automation").mock(side_effect=httpx.ReadTimeout("vencido"))
+    with pytest.raises(CrmUnreachable):
+        await cliente.automation_put(13, {})  # el panel relee appliedVersion (R5)
+
+
+@respx.mock
+async def test_laboratorio_iniciar_y_consultar(cliente: BrainsCrmClient) -> None:
+    respx.post(f"{CRM_URL}/api/brains/lab/runs").mock(return_value=httpx.Response(202, json={"runId": "run_1"}))
+    estado = {"status": "running", "progress": {"done": 1, "total": 7}, "score": None, "cases": []}
+    respx.get(f"{CRM_URL}/api/brains/lab/runs/run_1").mock(return_value=httpx.Response(200, json=estado))
+
+    assert await cliente.lab_run_start() == "run_1"
+    assert await cliente.lab_run_get("run_1") == estado
+
+
+@respx.mock
+async def test_laboratorio_ocupado(cliente: BrainsCrmClient) -> None:
+    respx.post(f"{CRM_URL}/api/brains/lab/runs").mock(
+        return_value=httpx.Response(409, json={"error": {"code": "run_in_progress", "message": "Ya hay una corrida"}})
+    )
+    with pytest.raises(CrmConflict) as exc:
+        await cliente.lab_run_start()
+    assert exc.value.code == "run_in_progress"
+
+
+# ── 025: el perfil del contexto queda solo para v1 ───────────────────────
+
+
+@pytest.mark.parametrize(
+    "contexto, con_perfil",
+    [
+        ({"contractVersion": 1, "agent": {"name": "Sofi"}, "knowledge": []}, True),
+        ({"agent": {"name": "Sofi"}}, True),  # el CRM de origen, sin versión
+        ({"contractVersion": 2}, False),  # v2: el perfil vive en Nea
+    ],
+)
+@respx.mock
+async def test_el_perfil_del_contexto_solo_en_v1(
+    cliente: BrainsCrmClient, contexto: dict[str, Any], con_perfil: bool
+) -> None:
+    respx.get(f"{CRM_URL}/api/brains/context").mock(return_value=httpx.Response(200, json=contexto))
+    cliente.registrar(IDENTITY, CONV)
+
+    await cliente.precargar(CONV)
+    assert (await cliente.get_profile() is not None) is con_perfil
+
+    await cliente.get_context(IDENTITY)  # consume la precarga
+    await cliente.get_context(IDENTITY)  # y vuelve a pedir
+    assert (await cliente.get_profile() is not None) is con_perfil
