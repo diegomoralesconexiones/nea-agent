@@ -612,7 +612,9 @@ async def run_turn(
     recientes = await ctx.store.recent_messages(
         conv.id, max(STALL_LOOKBACK, 2 * settings.stall_max_turns + 2)
     )
-    history = recientes[-settings.history_window :]
+    # Wline (026): si el CRM trae la bandeja, el hilo sale de ahí (lo del equipo incluido).
+    desde_wline = wline.historial(context)
+    history = desde_wline if desde_wline is not None else recientes[-settings.history_window :]
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}] + [
         {"role": m.role, "content": m.content} for m in history
     ]

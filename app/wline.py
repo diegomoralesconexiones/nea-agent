@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextvars
 import json
+from dataclasses import dataclass
 from typing import Any
 
 # ── 026: el silencio deliberado del turno (contracts/fase-a §3.1) ─────────
@@ -338,3 +339,38 @@ def una_sola_regla(prompt: str, context: dict[str, Any] | None) -> str:
     for viejo, nuevo in _UNA_SOLA_REGLA:
         prompt = prompt.replace(viejo, nuevo)
     return prompt
+
+
+# ── 026 (US5): el historial sale de la bandeja de Wline ──────────────────
+#
+# El contexto trae `history` (hasta 40 mensajes, del más viejo al más nuevo,
+# con lo que escribió el equipo). Nea lo usa en vez de su copia para lo que ve
+# el modelo y para la hostilidad; sin él, todo sigue como hasta hoy. El cierre
+# «sin rumbo» sigue contando sobre la copia de Nea: sus marcas de reapertura
+# son ids de esa copia (ponytail: se unifica en la fase C, cuando se retira).
+HISTORIAL_MODELO = 20
+MARCA_EQUIPO = "[Mensaje del equipo] "
+_ROL_DE_WLINE = {"cliente": "user", "ia": "assistant", "equipo": "assistant"}
+
+
+@dataclass(frozen=True)
+class MensajeHistorial:
+    role: str
+    content: str
+
+
+def historial(context: dict[str, Any] | None) -> list[MensajeHistorial] | None:
+    """Los últimos 20 mensajes del hilo según Wline, o None si no los trae."""
+    crudo = (context or {}).get("history")
+    if not isinstance(crudo, list):
+        return None
+    out: list[MensajeHistorial] = []
+    for m in crudo:
+        if not isinstance(m, dict):
+            continue
+        rol = _ROL_DE_WLINE.get(str(m.get("role")))
+        texto = m.get("text")
+        if rol is None or not isinstance(texto, str) or not texto.strip():
+            continue
+        out.append(MensajeHistorial(rol, (MARCA_EQUIPO if m.get("role") == "equipo" else "") + texto))
+    return out[-HISTORIAL_MODELO:]
