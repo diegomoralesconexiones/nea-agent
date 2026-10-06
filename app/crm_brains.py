@@ -414,6 +414,7 @@ class BrainsCrmClient(CrmClient):
         provider_ms: int | None,
         error: str | None,
         cadena: dict[str, Any] | None = None,
+        silencio: str | None = None,
     ) -> None:
         """Avisa al CRM que el turno de ese despacho terminó (Wline, N7).
 
@@ -429,6 +430,9 @@ class BrainsCrmClient(CrmClient):
         cuerpo: dict[str, Any] = {"providerMs": provider_ms, "error": (error or None) and error[:500]}
         if cadena:
             cuerpo["cadena"] = _cadena_para_wline(cadena)
+        if silencio:
+            # Wline (026): el turno calló a propósito (contracts/fase-a §3.1).
+            cuerpo["silencio"] = silencio
         try:
             resp = await self._request(
                 "POST", f"/api/brains/dispatch/{dispatch_id}/close", json=cuerpo

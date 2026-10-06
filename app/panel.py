@@ -30,7 +30,7 @@ from cryptography.exceptions import InvalidTag
 from fastapi import APIRouter, Depends, FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 
-from app import cadena
+from app import cadena, comportamiento
 from app.cadena import Plataforma
 from app.configuracion import SinLlaveDeCifrado, _json, _kb, cifrar, descifrar
 from app.crm import CrmConflict, CrmError
@@ -183,7 +183,13 @@ def _candado(request: Request) -> asyncio.Lock:
 SECCIONES = (
     "identidad", "instrucciones", "escalado", "conocimiento", "tipos",
     "ficha", "umbral", "capacidades", "cadena",
+    "comportamiento", "aviso_pase", "aviso_hostil",
 )
+# 026: secciones en las que «ausente» significa algo (el comportamiento
+# original, el aviso inicial de Wline, sin aviso hostil). Publicarlas con
+# `None` las quita de la versión nueva.
+OPCIONALES = ("comportamiento", "aviso_pase", "aviso_hostil")
+MAX_AVISO = 300
 MIGRACION = ("migración", "migración")
 SISTEMA = ("sistema", "sistema")
 _WLINE_CAIDO = "No pude hablar con Wline y no se guardó nada en ningún lado. Intenta de nuevo en un momento."
@@ -216,9 +222,15 @@ async def _vigente(pool: Any, org: str) -> Any:
     )
 
 
-def _reglas(contenido: dict[str, Any]) -> dict[str, Any]:
-    """Lo que Wline hace cumplir (R2); todo lo demás se queda en Nea."""
-    return {
+def _reglas(contenido: dict[str, Any], auto: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Lo que Wline hace cumplir (R2); todo lo demás se queda en Nea.
+
+    026: los dos avisos viajan con las reglas, el texto de ESTA versión o
+    `None` si no trae la sección. Solo si Wline los anuncia en su `GET`
+    (`rules.handoffNotice`): el Wline anterior a la 026 valida las reglas con
+    un esquema cerrado y rechazaría la publicación, y Nea se despliega antes.
+    """
+    reglas: dict[str, Any] = {
         "fichaFields": contenido.get("ficha") or [],
         "threshold": contenido.get("umbral") or "Clasificado",
         "capabilities": contenido.get("capacidades") or {},
@@ -227,6 +239,10 @@ def _reglas(contenido: dict[str, Any]) -> dict[str, Any]:
             for k, t in (contenido.get("tipos") or {}).items()
         },
     }
+    if "handoffNotice" in ((auto or {}).get("rules") or {}):
+        reglas["handoffNotice"] = contenido.get("aviso_pase") or None
+        reglas["hostileNotice"] = contenido.get("aviso_hostil") or None
+    return reglas
 
 
 def _con_tipo_cliente_de_wline(contenido: dict[str, Any], auto: dict[str, Any]) -> dict[str, Any]:
@@ -282,7 +298,7 @@ async def _publicar(
     movido = False
     try:
         try:
-            await crm.automation_put(numero, _reglas(contenido))
+            await crm.automation_put(numero, _reglas(contenido, auto))
         except CrmConflict as exc:
             if exc.code == "version_vieja":
                 raise ErrorPanel(409, "conflicto", "Wline ya tiene una versión más nueva. Recarga el panel.") from None
@@ -376,6 +392,23 @@ def _validar(seccion: str, valor: Any, plataformas: set[str]) -> None:
                 raise _invalido(f"Los extras del eslabón {i} pasan de 2 KB")
             if e.get("plataforma_id") not in plataformas:
                 raise _invalido(f"El eslabón {i} usa una plataforma que no existe")
+    elif seccion == "comportamiento":
+        # 026 (FR-121, FR-126): `None` es «volver al original»; vacío no se publica.
+        if valor is not None:
+            try:
+                comportamiento.validar(valor)
+            except ValueError as exc:
+                raise _invalido(str(exc)) from None
+    elif seccion in ("aviso_pase", "aviso_hostil"):
+        # 026 (FR-117, FR-119): el de pase nunca queda vacío; el hostil es
+        # opcional y `None` lo quita (entonces sale el aviso de pase).
+        if valor is None and seccion == "aviso_hostil":
+            return
+        nombre = "aviso de pase" if seccion == "aviso_pase" else "aviso para mensajes hostiles"
+        if not isinstance(valor, str) or not valor.strip():
+            raise _invalido(f"El {nombre} no puede quedar vacío")
+        if len(valor) > MAX_AVISO:
+            raise _invalido(f"El {nombre} pasa de {MAX_AVISO} caracteres")
     else:
         raise _invalido(f"«{seccion}» no es una sección del panel")
 
@@ -432,8 +465,14 @@ async def _guardar(
     resumen: str | None = None,
     restaurada_de: int | None = None,
     avisos: list[str] | None = None,
+    confirmar: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Publica la vigente con estas secciones encima. Con el candado tomado."""
+    """Publica la vigente con estas secciones encima. Con el candado tomado.
+
+    `confirmar`: las protecciones del comportamiento base que quien publica
+    aceptó modificar o quitar (FR-124). `None` = no se pregunta: restaurar una
+    versión vuelve a un estado que ya se publicó así.
+    """
     pool, org = ctx.store.pool, quien.organizacion
     avisos = list(avisos or [])
     vig, _ = await _migrar_si_falta(pool, org, auto)
@@ -443,7 +482,23 @@ async def _guardar(
     cambiadas = [s for s in SECCIONES if s in secciones and secciones[s] != actual.get(s)]
     if not cambiadas:
         return {"numero": vig["numero"], "avisos": avisos}
-    nuevo = {**actual, **secciones}
+    if confirmar is not None and "comportamiento" in cambiadas:
+        faltan = [
+            p for p in comportamiento.protecciones_por_confirmar(
+                secciones["comportamiento"], actual.get("comportamiento")
+            )
+            if p["clave"] not in confirmar
+        ]
+        if faltan:
+            raise ErrorPanel(
+                409, "confirmar_proteccion",
+                "Este cambio modifica o quita protecciones del agente: "
+                + ", ".join(f"«{p['titulo']}» ({p['cambio']})" for p in faltan)
+                + ". Confírmalo para publicar.",
+                protecciones=faltan,
+            )
+    # Una sección opcional publicada con `None` sale de la versión nueva.
+    nuevo = {k: v for k, v in {**actual, **secciones}.items() if not (k in OPCIONALES and v is None)}
     eslabones = nuevo.get("cadena") or []
     if "cadena" in cambiadas:
         falta = await _sin_certificar(pool, org, eslabones)
@@ -599,6 +654,11 @@ async def estado(request: Request, quien: Quien = Depends(firma)) -> dict[str, A
             "plataformas": await _plataformas(pool, org),
             "certificaciones": await _certificaciones(pool, org),
             "avisos": avisos,
+            # 026: el comportamiento base por partes (la versión o el original)
+            # y los avisos que Wline aplica hoy; `None` si aún no los conoce.
+            "comportamiento": comportamiento.estado(contenido.get("comportamiento")),
+            "avisoPase": (auto.get("rules") or {}).get("handoffNotice"),
+            "avisoHostil": (auto.get("rules") or {}).get("hostileNotice"),
         }
 
 
@@ -623,7 +683,11 @@ async def configuracion(request: Request, quien: Quien = Depends(firma)) -> dict
                 for e in secciones["cadena"]
             ]
         auto = await _automation(ctx.crm)
-        return await _guardar(ctx, quien, secciones, auto, base=datos["base"])
+        confirmar = datos.get("confirmar")
+        return await _guardar(
+            ctx, quien, secciones, auto, base=datos["base"],
+            confirmar=[str(c) for c in confirmar] if isinstance(confirmar, list) else [],
+        )
 
 
 # ── Historial, restaurar y conocimiento (FR-070, FR-071, R11) ────────────
@@ -669,6 +733,9 @@ async def restaurar(numero: int, request: Request, quien: Quien = Depends(firma)
             if e.get("plataforma_id") not in existentes:
                 avisos.append(f"Se omitió el eslabón {e.get('modelo')}: su plataforma ya no existe.")
         contenido = {
+            # 026: una sección opcional que esta versión no traía sale también
+            # de la nueva; sin esto se conservaría la de la vigente.
+            **{s: None for s in OPCIONALES},
             **contenido,
             "tipos": {k: t for k, t in tipos.items() if k in claves},
             "cadena": [e for e in eslabones if e.get("plataforma_id") in existentes],

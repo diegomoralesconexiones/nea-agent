@@ -22,6 +22,7 @@ from typing import Any
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from app import comportamiento
 from app.cadena import TOPE_INTENTO, Eslabon, LlmCadena, Plataforma
 from app.llm import OpenAiLlm
 from app.profile import BusinessProfile
@@ -236,8 +237,15 @@ async def preparar_contexto(
         )
         if prueba is not None:
             eslabones, certificados = [_json(prueba["eslabon"])], False
+    perfil = perfil_desde_contenido(contenido, settings.agent_name)
+    # 026 (US2): el comportamiento base de ESTE turno, ya sin las partes de las
+    # capacidades apagadas. `build_system_prompt` lo usa en vez del chasis.
+    if isinstance(context, dict):
+        context["comportamiento"] = comportamiento.resolver(
+            contenido.get("comportamiento"), context.get("capabilities"), perfil.agent_name
+        )
     return Preparacion(
-        perfil=perfil_desde_contenido(contenido, settings.agent_name),
+        perfil=perfil,
         cadena=await _armar_cadena(
             pool, organization_id, eslabones, settings.nea_encryption_key, certificados=certificados
         ),

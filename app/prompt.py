@@ -385,12 +385,14 @@ def build_system_prompt(
     # Wline (N2, N5): ficha pendiente, líneas, criterios, umbral y ubicación.
     lines.extend(wline.seccion_prompt(context))
 
-    return (
-        _chassis(profile)
+    return wline.una_sola_regla(  # Wline (026): sin las dobles salidas (FR-110)
+        # Wline (026): el comportamiento base del panel, si el turno lo trae.
+        ((context or {}).get("comportamiento") or _chassis(profile))
         + "\n\n"
         + _business_block(profile)
         + "\n"
-        + "\n".join(lines)
+        + "\n".join(lines),
+        context,
     )
 
 

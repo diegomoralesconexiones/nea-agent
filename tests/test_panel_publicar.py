@@ -972,3 +972,270 @@ async def test_aplicar_conocimiento_sin_abrir_el_panel_migra_primero(nea: Nea) -
     assert r.json()["numero"] == 2
     assert await numeros(nea.pool) == [1, 2]
     assert (await fila(nea.pool, 1))["resumen"] == "migración"
+
+
+# ── 026 · Los dos avisos (FR-117, FR-119; contracts/fase-a §2 y §5) ──────────
+
+AVISO = "Ya lo comunico con una persona de nuestro equipo."
+AVISO_HOSTIL = "No puedo responder a este tipo de mensajes. Le pasaré con una persona perteneciente al equipo."
+INICIAL_DE_WLINE = "Gracias por escribir. Una persona del equipo continuará esta conversación en breve."
+
+
+def _wline_026(nea: Nea) -> None:
+    """Un Wline que ya anuncia los avisos en su documento de reglas."""
+    nea.crm.rules["handoffNotice"] = INICIAL_DE_WLINE
+    nea.crm.rules["hostileNotice"] = None
+
+
+async def test_el_aviso_de_pase_viaja_a_wline_como_handoffNotice(nea: Nea) -> None:
+    _wline_026(nea)
+    await estado(nea)
+
+    r = await publicar(nea, 1, {"aviso_pase": AVISO})
+
+    assert r.status_code == 200, r.text
+    _, reglas = nea.crm.puts[-1]
+    assert reglas["handoffNotice"] == AVISO
+    assert reglas["hostileNotice"] is None
+    assert (await contenido_vigente(nea.pool))["aviso_pase"] == AVISO
+    assert (await fila(nea.pool, r.json()["numero"]))["resumen"] == "aviso_pase"
+
+
+async def test_el_aviso_hostil_viaja_como_hostileNotice_y_null_lo_quita(nea: Nea) -> None:
+    _wline_026(nea)
+    await estado(nea)
+
+    r = await publicar(nea, 1, {"aviso_hostil": AVISO_HOSTIL})
+    assert r.status_code == 200, r.text
+    assert nea.crm.puts[-1][1]["hostileNotice"] == AVISO_HOSTIL
+
+    r = await publicar(nea, r.json()["numero"], {"aviso_hostil": None})
+    assert r.status_code == 200, r.text
+    assert nea.crm.puts[-1][1]["hostileNotice"] is None
+    assert "aviso_hostil" not in await contenido_vigente(nea.pool)
+
+
+async def test_sin_las_secciones_los_avisos_viajan_null(nea: Nea) -> None:
+    _wline_026(nea)
+    await estado(nea)
+
+    assert (await publicar(nea, 1, {"instrucciones": "Vende por pieza."})).status_code == 200
+
+    _, reglas = nea.crm.puts[-1]
+    assert reglas["handoffNotice"] is None and reglas["hostileNotice"] is None
+
+
+async def test_a_un_wline_anterior_no_se_le_mandan_los_avisos(nea: Nea) -> None:
+    """Su esquema de reglas es cerrado: un campo que no conoce le haría rechazar
+    la publicación. Nea se despliega antes que Wline, así que tiene que convivir."""
+    await estado(nea)  # este Wline no anuncia handoffNotice
+
+    r = await publicar(nea, 1, {"aviso_pase": AVISO, "aviso_hostil": AVISO_HOSTIL})
+
+    assert r.status_code == 200, r.text
+    assert nea.crm.puts == [(2, REGLAS)]  # ni una clave nueva
+    c = await contenido_vigente(nea.pool)
+    assert (c["aviso_pase"], c["aviso_hostil"]) == (AVISO, AVISO_HOSTIL)  # quedan en la versión
+
+
+@pytest.mark.parametrize("seccion", ["aviso_pase", "aviso_hostil"])
+@pytest.mark.parametrize("valor", ["", "   ", "x" * 301, 7, ["a"]])
+async def test_un_aviso_vacio_largo_o_que_no_es_texto_se_rechaza(nea: Nea, seccion: str, valor: Any) -> None:
+    _wline_026(nea)
+    await estado(nea)
+
+    r = await publicar(nea, 1, {seccion: valor})
+
+    assert r.status_code == 422, r.text
+    assert nea.crm.puts == []
+
+
+async def test_el_aviso_de_pase_no_se_puede_quitar(nea: Nea) -> None:
+    _wline_026(nea)
+    await estado(nea)
+    assert (await publicar(nea, 1, {"aviso_pase": None})).status_code == 422
+
+
+async def test_el_estado_trae_los_avisos_que_rigen_en_wline(nea: Nea) -> None:
+    _wline_026(nea)
+    e = await estado(nea)
+    assert (e["avisoPase"], e["avisoHostil"]) == (INICIAL_DE_WLINE, None)
+
+    assert (await publicar(nea, 1, {"aviso_pase": AVISO, "aviso_hostil": AVISO_HOSTIL})).status_code == 200
+    e = await estado(nea)
+    assert (e["avisoPase"], e["avisoHostil"]) == (AVISO, AVISO_HOSTIL)
+
+
+async def test_el_estado_con_un_wline_anterior_no_trae_avisos(nea: Nea) -> None:
+    e = await estado(nea)
+    assert (e["avisoPase"], e["avisoHostil"]) == (None, None)
+
+
+# ── 026 · El juez recibe el mismo escalado que el agente (FR-111) ────────────
+
+
+async def test_el_juez_recibe_el_mismo_escalado_que_el_agente(nea: Nea) -> None:
+    from datetime import datetime, timezone
+
+    from app.prompt import build_system_prompt
+    from app.state import MemoryStore
+    from tests.wline_fixtures import contexto
+
+    regla = "Pasa la conversación a una persona si el cliente está molesto o trae una queja."
+    await estado(nea)
+    assert (await publicar(nea, 1, {"escalado": regla})).status_code == 200
+
+    juez = (await nea.pedir("GET", "/panel/api/juez", r="sistema")).json()["comportamiento"]
+    ctx = contexto()
+    prep = await preparar_contexto(nea.pool, ORG, ctx, nea.settings)
+    conv = await MemoryStore().get_or_create_conversation("525550001111")
+    prompt = build_system_prompt(
+        profile=prep.perfil, context=ctx, conv=conv, agenda=False,
+        now=datetime(2026, 10, 6, 15, 0, tzinfo=timezone.utc),
+    )
+
+    # Carácter por carácter: lo que sigue a «Escalado: » es la regla, entera.
+    assert juez.split("Escalado: ", 1)[1] == regla
+    assert prompt.count(regla) == 1
+
+
+# ── 026 · Comportamiento base por partes (FR-120 a FR-126) ───────────────────
+
+
+def _original() -> list[dict[str, str]]:
+    from app.comportamiento import ORIGINAL
+
+    return [{"clave": p.clave, "titulo": p.titulo, "texto": p.texto} for p in ORIGINAL]
+
+
+async def test_publicar_el_comportamiento_crea_version_con_autor(nea: Nea) -> None:
+    await estado(nea)
+    seccion = _original()
+    seccion[1]["texto"] = "Habla de usted y con frases cortas."
+
+    r = await publicar(nea, 1, {"comportamiento": seccion})
+
+    assert r.status_code == 200, r.text
+    assert r.json()["numero"] == 2
+    v2 = await fila(nea.pool, 2)
+    assert (v2["resumen"], v2["autor_correo"]) == ("comportamiento", "duena@example.com")
+    assert (await contenido_vigente(nea.pool))["comportamiento"][1]["texto"] == "Habla de usted y con frases cortas."
+    assert nea.crm.puts == [(2, REGLAS)]  # el comportamiento no sale de Nea
+
+
+async def test_el_turno_usa_el_comportamiento_publicado(nea: Nea) -> None:
+    from tests.wline_fixtures import contexto
+
+    await estado(nea)
+    seccion = _original()
+    seccion[1]["texto"] = "Habla de usted y con frases cortas."
+    assert (await publicar(nea, 1, {"comportamiento": seccion})).status_code == 200
+
+    ctx = contexto()
+    await preparar_contexto(nea.pool, ORG, ctx, nea.settings)
+
+    assert "Habla de usted y con frases cortas." in ctx["comportamiento"]
+
+
+async def test_null_vuelve_al_original_como_version_nueva(nea: Nea) -> None:
+    await estado(nea)
+    seccion = _original()
+    seccion[1]["texto"] = "Habla de usted."
+    assert (await publicar(nea, 1, {"comportamiento": seccion})).status_code == 200
+    assert (await estado(nea))["comportamiento"]["editado"] is True
+
+    r = await publicar(nea, 2, {"comportamiento": None})
+
+    assert r.status_code == 200, r.text
+    assert r.json()["numero"] == 3
+    assert "comportamiento" not in await contenido_vigente(nea.pool)
+    e = await estado(nea)
+    assert e["comportamiento"]["editado"] is False
+    assert [p["texto"] for p in e["comportamiento"]["partes"]] == [p["texto"] for p in _original()]
+
+
+async def test_el_estado_dice_que_partes_son_proteccion_o_de_una_capacidad(nea: Nea) -> None:
+    partes = {p["clave"]: p for p in (await estado(nea))["comportamiento"]["partes"]}
+
+    assert [c for c, p in partes.items() if p["proteccion"]] == ["ia", "no_revelar", "datos_no_ordenes", "no_inventar"]
+    assert partes["agenda"]["capacidad"] == "agendar"
+    assert partes["rol"]["capacidad"] is None and partes["rol"]["proteccion"] is False
+
+
+async def test_tocar_una_proteccion_pide_confirmacion(nea: Nea) -> None:
+    await estado(nea)
+    seccion = [p for p in _original() if p["clave"] != "ia"]
+    next(p for p in seccion if p["clave"] == "no_inventar")["texto"] = "Inventa lo que haga falta."
+
+    r = await publicar(nea, 1, {"comportamiento": seccion})
+
+    assert r.status_code == 409, r.text
+    error = r.json()["error"]
+    assert error["code"] == "confirmar_proteccion"
+    assert {(p["clave"], p["cambio"]) for p in error["protecciones"]} == {
+        ("ia", "quitada"), ("no_inventar", "modificada"),
+    }
+    assert all(p["titulo"] for p in error["protecciones"])
+    assert nea.crm.puts == [] and await vigente(nea.pool) == 1
+
+
+async def test_con_la_confirmacion_completa_publica_y_con_una_incompleta_no(nea: Nea) -> None:
+    await estado(nea)
+    seccion = [p for p in _original() if p["clave"] != "ia"]
+    next(p for p in seccion if p["clave"] == "no_inventar")["texto"] = "Inventa lo que haga falta."
+    cuerpo = {"base": 1, "secciones": {"comportamiento": seccion}}
+
+    r = await nea.pedir("PUT", "/panel/api/configuracion", {**cuerpo, "confirmar": ["ia"]})
+    assert r.status_code == 409
+    assert [p["clave"] for p in r.json()["error"]["protecciones"]] == ["no_inventar"]  # la que falta
+
+    r = await nea.pedir("PUT", "/panel/api/configuracion", {**cuerpo, "confirmar": ["ia", "no_inventar"]})
+    assert r.status_code == 200, r.text
+    assert await vigente(nea.pool) == 2
+
+
+async def test_un_comportamiento_vacio_se_rechaza(nea: Nea) -> None:
+    await estado(nea)
+    assert (await publicar(nea, 1, {"comportamiento": []})).status_code == 422
+
+
+# ── 026 · Restaurar una versión (casos límite del spec) ──────────────────────
+
+
+async def test_restaurar_trae_de_vuelta_el_comportamiento_y_los_avisos(nea: Nea) -> None:
+    _wline_026(nea)
+    await estado(nea)
+    seccion = _original()
+    seccion[1]["texto"] = "Habla de usted."
+    primera = {"comportamiento": seccion, "aviso_pase": AVISO, "aviso_hostil": AVISO_HOSTIL}
+    assert (await publicar(nea, 1, primera)).status_code == 200
+    segunda = {"comportamiento": None, "aviso_pase": "Otro aviso.", "aviso_hostil": None}
+    assert (await publicar(nea, 2, segunda)).status_code == 200
+
+    r = await nea.pedir("POST", "/panel/api/versiones/2/restaurar")
+
+    assert r.status_code == 200, r.text
+    c = await contenido_vigente(nea.pool)
+    assert c["comportamiento"][1]["texto"] == "Habla de usted."
+    assert (c["aviso_pase"], c["aviso_hostil"]) == (AVISO, AVISO_HOSTIL)
+    _, reglas = nea.crm.puts[-1]  # la restauración vuelve a mandar los avisos de ESA versión
+    assert (reglas["handoffNotice"], reglas["hostileNotice"]) == (AVISO, AVISO_HOSTIL)
+
+
+async def test_restaurar_una_version_sin_esas_secciones_las_quita(nea: Nea) -> None:
+    """Hoy restaurar mezcla la versión vieja sobre la vigente: sin esto, un
+    comportamiento editado sobreviviría a restaurar una versión que no lo traía."""
+    _wline_026(nea)
+    await estado(nea)  # la versión 1 no trae comportamiento ni avisos
+    seccion = _original()
+    seccion[1]["texto"] = "Habla de usted."
+    primera = {"comportamiento": seccion, "aviso_pase": AVISO, "aviso_hostil": AVISO_HOSTIL}
+    assert (await publicar(nea, 1, primera)).status_code == 200
+
+    r = await nea.pedir("POST", "/panel/api/versiones/1/restaurar")
+
+    assert r.status_code == 200, r.text
+    c = await contenido_vigente(nea.pool)
+    assert not {"comportamiento", "aviso_pase", "aviso_hostil"} & set(c)
+    _, reglas = nea.crm.puts[-1]
+    assert reglas["handoffNotice"] is None and reglas["hostileNotice"] is None

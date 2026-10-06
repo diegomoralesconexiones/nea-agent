@@ -417,3 +417,120 @@ async def test_el_perfil_del_contexto_solo_en_v1(
     await cliente.get_context(IDENTITY)  # consume la precarga
     await cliente.get_context(IDENTITY)  # y vuelve a pedir
     assert (await cliente.get_profile() is not None) is con_perfil
+
+
+# ── 026: el silencio deliberado viaja en el cierre (contracts/fase-a §3.1) ──
+#
+# Tras la despedida del cierre «sin rumbo», el relleno no se contesta. Wline
+# trata un turno sin mensaje como una falla y pasa la conversación a una
+# persona; para que no lo haga aquí, el cierre dice que el silencio fue a
+# propósito.
+
+
+@respx.mock
+async def test_el_cierre_lleva_el_silencio_deliberado(cliente: BrainsCrmClient) -> None:
+    ruta = respx.post(f"{CRM_URL}/api/brains/dispatch/dsp_1/close").mock(
+        return_value=httpx.Response(200, json={"outcome": "modelo_sin_accion"})
+    )
+    await cliente.cerrar_despacho("dsp_1", None, None, silencio="sin_rumbo")
+
+    assert json.loads(ruta.calls.last.request.content) == {
+        "providerMs": None, "error": None, "silencio": "sin_rumbo",
+    }
+
+
+@respx.mock
+async def test_sin_silencio_el_cierre_no_cambia(cliente: BrainsCrmClient) -> None:
+    ruta = respx.post(f"{CRM_URL}/api/brains/dispatch/dsp_1/close").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    await cliente.cerrar_despacho("dsp_1", 10, None)
+
+    assert "silencio" not in json.loads(ruta.calls.last.request.content)
+
+
+class CrmQueAnotaElSilencio(CrmQueAnota):
+    def __init__(self) -> None:
+        super().__init__()
+        self.silencios: list[str | None] = []
+
+    async def cerrar_despacho(  # type: ignore[override]
+        self, dispatch_id: str, provider_ms: int | None, error: str | None,
+        cadena: dict[str, Any] | None = None, silencio: str | None = None,
+    ) -> None:
+        await super().cerrar_despacho(dispatch_id, provider_ms, error, cadena)
+        self.silencios.append(silencio)
+
+
+async def test_el_despacho_cierra_con_lo_que_marco_el_turno(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import wline
+
+    async def handle_flush(ctx: AppContext, identity: str, items: list[Any], **_: Any) -> None:
+        wline.marcar_silencio("sin_rumbo")
+
+    monkeypatch.setattr(dispatch, "handle_flush", handle_flush)
+    crm = CrmQueAnotaElSilencio()
+    await dispatch._procesar(_ctx(crm), _payload())
+
+    assert crm.silencios == ["sin_rumbo"]
+
+
+async def test_un_turno_que_no_marca_cierra_como_siempre(turno_con_modelo: None) -> None:
+    """Sin marca no se manda el argumento: los CRM que no lo conocen siguen igual."""
+    crm = CrmQueAnota()  # su cerrar_despacho no acepta `silencio`
+    await dispatch._procesar(_ctx(crm), _payload())
+
+    assert len(crm.cierres) == 1
+
+
+async def test_la_marca_de_un_turno_no_pasa_al_siguiente(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import wline
+
+    veces = {"n": 0}
+
+    async def handle_flush(ctx: AppContext, identity: str, items: list[Any], **_: Any) -> None:
+        veces["n"] += 1
+        if veces["n"] == 1:
+            wline.marcar_silencio("sin_rumbo")
+
+    monkeypatch.setattr(dispatch, "handle_flush", handle_flush)
+    crm = CrmQueAnotaElSilencio()
+    await dispatch._procesar(_ctx(crm), _payload("dsp_1"))
+    await dispatch._procesar(_ctx(crm), _payload("dsp_2"))
+
+    assert crm.silencios == ["sin_rumbo", None]
+
+
+async def test_el_relleno_tras_el_cierre_sin_rumbo_marca_el_silencio() -> None:
+    """El camino real del turno: conversación ya despedida, llega un «gracias»."""
+    from app import wline
+    from app.state import utcnow
+    from app.turn import handle_flush
+
+    ctx = _ctx(CrmQueAnota())
+    conv = await ctx.store.get_or_create_conversation(IDENTITY)
+    await ctx.store.update_conversation(conv.id, crm_conversation_id=CONV, stalled_at=utcnow())
+    payload = _payload()
+    payload["messages"] = [{"id": "msg_9", "type": "text", "text": "gracias"}]
+
+    marca = wline.medir_silencio()
+    await handle_flush(ctx, IDENTITY, dispatch.mensajes_del_despacho(payload), crm_conversation_id=CONV)
+
+    assert marca == ["sin_rumbo"]
+
+
+async def test_un_mensaje_con_contenido_no_marca_silencio() -> None:
+    from app import wline
+    from app.state import utcnow
+    from app.turn import handle_flush
+
+    ctx = _ctx(CrmQueAnota())
+    conv = await ctx.store.get_or_create_conversation(IDENTITY)
+    await ctx.store.update_conversation(conv.id, crm_conversation_id=CONV, stalled_at=utcnow())
+    payload = _payload()
+    payload["messages"] = [{"id": "msg_9", "type": "text", "text": "¿cuánto cuesta el envío?"}]
+
+    marca = wline.medir_silencio()
+    await handle_flush(ctx, IDENTITY, dispatch.mensajes_del_despacho(payload), crm_conversation_id=CONV)
+
+    assert marca == []

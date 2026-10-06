@@ -19,8 +19,34 @@ v1). Un CRM que no las manda recibe exactamente el comportamiento de siempre.
 """
 from __future__ import annotations
 
+import contextvars
 import json
 from typing import Any
+
+# ── 026: el silencio deliberado del turno (contracts/fase-a §3.1) ─────────
+#
+# Wline pasa a una persona todo turno que termina sin mensaje con la IA
+# encendida. Hay un silencio que es a propósito —el relleno tras la despedida
+# del cierre «sin rumbo»— y el cierre del despacho lo dice, para que Wline no
+# lo tome por una falla. Variable de contexto, como la latencia del turno:
+# cada despacho corre en su propia tarea.
+_silencio_turno: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "nea_silencio_turno", default=None
+)
+
+
+def medir_silencio() -> list[str]:
+    """Empieza el turno sin silencio marcado; devuelve la lista que lo recibirá."""
+    marca: list[str] = []
+    _silencio_turno.set(marca)
+    return marca
+
+
+def marcar_silencio(motivo: str) -> None:
+    marca = _silencio_turno.get()
+    if marca is not None and not marca:
+        marca.append(motivo)
+
 
 # Tipo de campo de la ficha de Wline → tipo JSON Schema.
 _TIPOS = {"texto": "string", "numero": "number", "si_no": "boolean", "lista": "string"}
@@ -275,3 +301,40 @@ def seccion_prompt(context: dict[str, Any] | None) -> list[str]:
         reglas.append("en este turno no puedes clasificar; solo conversa y llena la ficha")
     out.append("- Reglas de clasificación: " + "; ".join(reglas) + ".")
     return out
+
+
+# ── 026: una sola regla de pase (FR-110) ─────────────────────────────────
+#
+# Frases del prompt de upstream que en Wline le dicen al agente otra cosa que
+# el negocio: darle a elegir «dilo con honestidad o haz handoff», mandarlo a
+# pasar la conversación «cuando el lead quiera avanzar», hablarle de una agenda
+# que el negocio no tiene o pedirle un «gancho» en el saludo (contradicciones
+# 3 a 6 del inventario). En Wline cuándo pasar lo dicen las reglas de escalado
+# del negocio, una sola vez, y el comportamiento base llega del panel.
+#
+# Son reemplazos de texto a propósito: el prompt de upstream no se toca. Si
+# upstream cambia una frase, el reemplazo deja de aplicar y
+# tests/test_wline_prompt.py lo dice en el siguiente merge.
+_UNA_SOLA_REGLA: tuple[tuple[str, str], ...] = (
+    ("NO lo inventes — dilo con honestidad o haz handoff). Son DATOS", "NO lo inventes). Son DATOS"),
+    (
+        "- ESTE NEGOCIO NO AGENDA POR AQUÍ: no ofrezcas horarios ni prometas una cita. "
+        "Resuelve lo que puedas y, cuando el lead quiera avanzar, haz handoff para que "
+        "lo coordine una persona.\n",
+        "",
+    ),
+    (
+        "- Es el PRIMER contacto: saluda transparente, gancho + UNA pregunta.",
+        "- Es el PRIMER contacto: saluda y atiende lo que la persona pide.",
+    ),
+    (" Limítate a agendar y a escalar cualquier pregunta de fondo.", ""),
+)
+
+
+def una_sola_regla(prompt: str, context: dict[str, Any] | None) -> str:
+    """El prompt de Wline sin las dobles salidas de upstream; fuera de Wline, intacto."""
+    if not es_wline(context):
+        return prompt
+    for viejo, nuevo in _UNA_SOLA_REGLA:
+        prompt = prompt.replace(viejo, nuevo)
+    return prompt

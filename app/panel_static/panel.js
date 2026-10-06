@@ -520,9 +520,72 @@
     });
   }
 
+  // ── 026: los dos avisos y el comportamiento base ────────────────────────
+
+  function pintarPase(cuerpo, c) {
+    // Sin texto propio, se muestra el que Wline aplica hoy (su texto inicial).
+    const pase = area(c.aviso_pase || estado.avisoPase || "", 2, { maxlength: 300 });
+    const hostil = area(c.aviso_hostil || "", 2, { maxlength: 300 });
+    const sinWline = estado.avisoPase === null || estado.avisoPase === undefined;
+    cuerpo.replaceChildren(
+      campo("Aviso de pase", pase, "Lo recibe quien pidió hablar con una persona, y también cuando el agente no pudo responder.", true),
+      campo("Aviso para mensajes hostiles", hostil, "Lo recibe quien insulta. Si lo dejas vacío, recibe el aviso de pase."),
+      sinWline
+        ? el("p", { class: "tenue" }, "Wline todavía no aplica estos avisos: se guardan aquí y empezarán a salir cuando Wline se actualice.")
+        : null
+    );
+    return () => {
+      if (!pase.value.trim()) throw new Error("El aviso de pase no puede quedar vacío.");
+      return { aviso_pase: pase.value.trim(), aviso_hostil: hostil.value.trim() || null };
+    };
+  }
+
+  function pintarComportamiento(cuerpo) {
+    const info = estado.comportamiento || { partes: [], editado: false };
+    const lista = el("ol", { class: "entradas" });
+    const filas = [];
+    function agregar(parte) {
+      const fila = { clave: parte.clave || "parte_" + Date.now().toString(36) + "_" + filas.length };
+      fila.titulo = texto(parte.titulo, { maxlength: 80 });
+      fila.texto = area(parte.texto, 6, { maxlength: 8000 });
+      const quitar = el("button", { type: "button", class: "quitar" }, "Quitar esta parte");
+      const capacidad = parte.capacidad && ((estado.catalogoCapacidades || {})[parte.capacidad] || {}).label;
+      fila.nodo = el(
+        "li",
+        { class: "entrada", "data-clave": fila.clave },
+        parte.proteccion ? el("span", { class: "etiqueta pendiente" }, "protección") : null,
+        parte.capacidad ? el("span", { class: "etiqueta" }, "solo con «" + (capacidad || parte.capacidad) + "» encendida") : null,
+        campo("Título", fila.titulo, null, true),
+        campo("Texto", fila.texto, null, true),
+        quitar
+      );
+      quitar.addEventListener("click", () => {
+        filas.splice(filas.indexOf(fila), 1);
+        fila.nodo.remove();
+      });
+      filas.push(fila);
+      lista.append(fila.nodo);
+    }
+    info.partes.forEach(agregar);
+    cuerpo.replaceChildren(
+      el("p", { class: "tenue" }, info.editado ? "Editado por tu negocio." : "Es el original: todavía no lo has editado."),
+      lista,
+      el("div", { class: "acciones" }, el("button", { type: "button", onclick: () => agregar({}) }, "Agregar una parte"))
+    );
+    const leer = () => {
+      if (!filas.length) throw new Error("El comportamiento base no puede quedar vacío.");
+      return { comportamiento: filas.map((f) => ({ clave: f.clave, titulo: f.titulo.value, texto: f.texto.value })) };
+    };
+    // Un segundo botón del pie: publica la versión sin esta sección.
+    leer.extra = info.editado ? [["Volver al original", () => ({ comportamiento: null })]] : [];
+    return leer;
+  }
+
   const SECCIONES = {
     identidad: pintarIdentidad,
     instrucciones: pintarInstrucciones,
+    pase: pintarPase,
+    comportamiento: pintarComportamiento,
     conocimiento: pintarConocimiento,
     tipos: pintarTipos,
     reglas: pintarReglas,
@@ -536,11 +599,16 @@
     const nota = el("p", { class: "mensaje", role: "status" });
     const boton = el("button", { type: "button", class: "primario" }, "Guardar y publicar");
     boton.addEventListener("click", () => guardar(id, leer, boton, nota));
-    cuerpo.append(el("div", { class: "pie" }, boton, nota));
+    const otros = (leer.extra || []).map(([etiqueta, leerOtro]) => {
+      const b = el("button", { type: "button" }, etiqueta);
+      b.addEventListener("click", () => guardar(id, leerOtro, b, nota));
+      return b;
+    });
+    cuerpo.append(el("div", { class: "pie" }, boton, ...otros, nota));
     if (mensaje) decir(nota, mensaje[0], mensaje[1]);
   }
 
-  async function guardar(id, leer, boton, nota) {
+  async function guardar(id, leer, boton, nota, confirmar) {
     let secciones;
     try {
       secciones = leer();
@@ -552,15 +620,28 @@
     decir(nota, "Publicando…");
     const antes = estado.vigente.numero;
     try {
-      const r = await api("PUT", "/configuracion", { base: bases[id], secciones });
+      const cuerpo = { base: bases[id], secciones };
+      if (confirmar) cuerpo.confirmar = confirmar;
+      const r = await api("PUT", "/configuracion", cuerpo);
       await recargar();
       pintarSeccion(id, r.numero === antes ? ["No había cambios que publicar.", "ok"] : ["Publicado: versión " + r.numero + ".", "ok"]);
       pintarCabecera();
       pintarHistorial();
       agregarAvisos(r.avisos);
     } catch (error) {
-      decir(nota, explicar(error), "error");
       boton.disabled = false;
+      // 026 (FR-124): el panel dice qué protección cambia o se pierde y pregunta.
+      if (error.datos && error.datos.code === "confirmar_proteccion" && !confirmar) {
+        const protecciones = error.datos.protecciones || [];
+        const cuales = protecciones.map((p) => "«" + p.titulo + "» (" + p.cambio + ")").join(", ");
+        if (window.confirm("Este cambio toca protecciones del agente: " + cuales + ". ¿Publicar de todos modos?")) {
+          await guardar(id, leer, boton, nota, protecciones.map((p) => p.clave));
+        } else {
+          decir(nota, "No se publicó: las protecciones quedaron como estaban.");
+        }
+        return;
+      }
+      decir(nota, explicar(error), "error");
     }
   }
 

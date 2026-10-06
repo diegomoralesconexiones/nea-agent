@@ -29,6 +29,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from app import wline
 from app.cadena import iniciar_turno
 from app.configuracion import PerfilFijo, preparar_contexto
 from app.http_limits import limited_body
@@ -241,6 +242,7 @@ async def _procesar(ctx: AppContext, payload: dict[str, Any], *, durable: bool =
     """
     dispatch_id = str(payload.get("dispatchId") or "")
     latencias = medir_turno()
+    silencio = wline.medir_silencio()  # Wline (026): ¿el turno calló a propósito?
     # Wline (025): 90 s desde aquí para todo el turno, y la traza de la cadena
     # que viaja en el cierre (R6, R16).
     traza = iniciar_turno()
@@ -257,7 +259,9 @@ async def _procesar(ctx: AppContext, payload: dict[str, Any], *, durable: bool =
         cerrar = getattr(estado["crm"], "cerrar_despacho", None)
         if estado["procesado"] and dispatch_id and callable(cerrar):
             await cerrar(
-                dispatch_id, round(sum(latencias)) if latencias else None, error, traza or None
+                dispatch_id, round(sum(latencias)) if latencias else None, error, traza or None,
+                # Wline (026): solo si lo hubo, para no pedirle el argumento a los CRM de upstream.
+                **({"silencio": silencio[0]} if silencio else {}),
             )
 
 

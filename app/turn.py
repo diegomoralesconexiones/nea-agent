@@ -512,6 +512,7 @@ async def run_turn(
                 "turno %s: relleno tras el cierre por falta de rumbo — silencio",
                 identity,
             )
+            wline.marcar_silencio("sin_rumbo")  # Wline (026): a propósito, no es una falla
             return
         logger.info(
             "turno %s: %s — reabro",
