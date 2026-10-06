@@ -442,6 +442,20 @@ class BrainsCrmClient(CrmClient):
         except Exception:
             logger.exception("no pude cerrar el despacho %s", dispatch_id)
 
+    async def post_handoff(self, conversation_id: str, reason: str | None = None) -> None:
+        """Wline (026, FR-116): el motivo de pase viaja tal cual.
+
+        La lista de motivos es una y vive en Wline, que guarda `modelo` si no
+        reconoce lo que llega. Nea ya no la traduce a su catálogo de upstream.
+        """
+        cuerpo: dict[str, Any] = {"conversationId": conversation_id}
+        motivo = (reason or "").strip()
+        if motivo:
+            cuerpo["reason"] = motivo[:120]
+        resp = await self._request("POST", "/api/bot/handoff", json=cuerpo)
+        if resp.status_code != 200:
+            raise CrmError(f"handoff devolvió {resp.status_code}")
+
     async def move_lead(self, conversation_id: str, linea: str, etapa: str) -> dict[str, Any]:
         """Propone ubicar al lead (Wline, N3). El CRM decide.
 

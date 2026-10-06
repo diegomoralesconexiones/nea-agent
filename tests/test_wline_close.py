@@ -534,3 +534,32 @@ async def test_un_mensaje_con_contenido_no_marca_silencio() -> None:
     await handle_flush(ctx, IDENTITY, dispatch.mensajes_del_despacho(payload), crm_conversation_id=CONV)
 
     assert marca == []
+
+
+# ── 026: el motivo de pase viaja tal cual (FR-116) ────────────────────────
+# La lista de motivos es una y vive en Wline. Nea ya no traduce lo que escribe
+# el modelo a su catálogo de upstream: lo manda, y Wline guarda `modelo` si no
+# lo reconoce.
+
+
+@respx.mock
+async def test_el_motivo_de_pase_viaja_tal_cual(cliente: BrainsCrmClient) -> None:
+    ruta = respx.post(f"{CRM_URL}/api/brains/handoff").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    await cliente.post_handoff(CONV, "hostilidad")
+    assert json.loads(ruta.calls.last.request.content) == {
+        "conversationId": CONV, "reason": "hostilidad",
+    }
+    # Un motivo libre del modelo no se traduce aquí: lo normaliza Wline.
+    await cliente.post_handoff(CONV, "  pidió humano ")
+    assert json.loads(ruta.calls.last.request.content)["reason"] == "pidió humano"
+
+
+@respx.mock
+async def test_sin_motivo_no_viaja_el_campo(cliente: BrainsCrmClient) -> None:
+    ruta = respx.post(f"{CRM_URL}/api/brains/handoff").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    await cliente.post_handoff(CONV, None)
+    assert json.loads(ruta.calls.last.request.content) == {"conversationId": CONV}
